@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Страница для тестирования AI QA</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 50px auto; line-height: 1.6; border: 1px solid #eee; padding: 20px; border-radius: 10px; }
+        .section { margin-bottom: 20px; padding: 15px; border-bottom: 1px solid #f0f0f0; }
+        input[type="text"] { padding: 8px; width: 200px; }
+        button { padding: 10px 20px; cursor: pointer; transition: background 0.3s; }
+        #successMessage { color: green; font-weight: bold; display: none; margin-top: 10px; }
+        .hint { font-size: 0.8em; color: #666; }
+    </style>
+</head>
+<body>
+
+    <h2>Тестовая форма</h2>
+
+    <div class="section">
+        <label>Введите ваше имя:</label><br>
+        <input type="text" id="nameInput" placeholder="Имя пользователя...">
+    </div>
+
+    <div class="section">
+        <p>Выберите действие:</p>
+        <!-- Кнопка с текстом, отличным от "входа", для проверки семантики -->
+        <button id="loginBtn">Авторизоваться в системе</button>
+        <button id="cancelBtn" style="background: #eee; border: 1px solid #ccc;">Отмена</button>
+    </div>
+
+    <div class="section">
+        <p>Дополнительные ссылки:</p>
+        <a href="#" id="helpLink">Получить помощь по сайту</a>
+    </div>
+
+    <div id="successMessage">Успех! Действие выполнено.</div>
+
+    <script>
+        // Простая логика для проверки "Expected Result"
+        document.getElementById('loginBtn').addEventListener('click', () => {
+            const name = document.getElementById('nameInput').value;
+            const msg = document.getElementById('successMessage');
+            
+            if(name.trim() !== "") {
+                msg.innerText = "Добро пожаловать, " + name + "! Доступ разрешен.";
+            } else {
+                msg.innerText = "Успех! Вы вошли как гость.";
+            }
+            msg.style.display = 'block';
+        });
+
+        document.getElementById('helpLink').addEventListener('click', (e) => {
+            e.preventDefault();
+            alert("Здесь могла быть ваша справка");
+        });
+    </script>
+
+    <div class="hint">
+        <p><strong>Попробуй ввести в расширение:</strong></p>
+        <ol>
+            <li>Нажать на кнопку входа (модель должна понять, что это "Авторизоваться")</li>
+            <li>Результат: Доступ разрешен</li>
+        </ol>
+    </div>
+
+</body>
+</html>

@@ -2,7 +2,6 @@ import { pipeline, env } from './lib/transformers.min.js';
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
-
 if (env.backends?.onnx?.wasm) {
   env.backends.onnx.wasm.proxy = false;
   env.backends.onnx.wasm.numThreads = 1;
@@ -40,6 +39,7 @@ function cosineSimilarity(vecA, vecB) {
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// Парсинг сценария с поддержкой различных действий
 function parseScenario(text) {
   const lines = text.split('\n').filter(line => line.trim() !== '');
   const steps = [];
@@ -47,6 +47,7 @@ function parseScenario(text) {
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
+    // Ожидаемый результат
     const resultMatch = line.match(/^(Результат|Result|Then|Ожидаемый результат)\s*[:：-]\s*(.+)/i);
     if (resultMatch) {
       const expected = resultMatch[2].trim();
@@ -55,23 +56,61 @@ function parseScenario(text) {
         steps.push(currentAction);
         currentAction = null;
       } else {
-        steps.push({ action: null, expected });
+        steps.push({ action: null, type: null, target: null, value: null, expected });
       }
-    } else {
-      if (currentAction) steps.push(currentAction);
-      currentAction = { action: line, expected: null };
+      continue;
     }
+    // Если есть незавершённое действие, сохраняем его
+    if (currentAction) steps.push(currentAction);
+
+    // Определяем тип действия и извлекаем цель/значение
+    const actionObj = parseActionLine(line);
+    currentAction = actionObj;
   }
   if (currentAction) steps.push(currentAction);
   return steps;
 }
 
+function parseActionLine(line) {
+  // Паттерны для русских и английских команд
+  const patterns = [
+    { regex: /^(?:кликни|нажми|клик|перейди|открой|click|tap|press|open|go to)\s+(.+)/i, type: 'click' },
+    { regex: /^(?:введи|напиши|заполни|вставь|input|type|fill|enter)\s+(.+)/i, type: 'input' },
+    { regex: /^(?:выбери|отметь|select|choose|pick)\s+(.+)/i, type: 'select' }
+  ];
+
+  for (const { regex, type } of patterns) {
+    const match = line.match(regex);
+    if (match) {
+      let target = match[1].trim();
+      let value = null;
+      if (type === 'input' || type === 'select') {
+        // Попытка выделить значение после слова-разделителя
+        const valueRegex = /\s+(?:как|значение|текст|value|text|:)\s+(.+)/i;
+        const valueMatch = target.match(valueRegex);
+        if (valueMatch) {
+          value = valueMatch[1].trim();
+          target = target.substring(0, valueMatch.index).trim();
+        } else {
+          // Если разделителя нет, считаем последнее слово значением
+          const words = target.split(/\s+/);
+          if (words.length > 1) {
+            value = words.pop();
+            target = words.join(' ');
+          }
+        }
+      }
+      return { action: line, type, target, value, expected: null };
+    }
+  }
+  // По умолчанию — клик
+  return { action: line, type: 'click', target: line, value: null, expected: null };
+}
+
 async function sendMessageToTabSafely(tabId, message) {
   try {
     const response = await chrome.tabs.sendMessage(tabId, message);
-    if (chrome.runtime.lastError) {
-      throw new Error(chrome.runtime.lastError.message);
-    }
+    if (chrome.runtime.lastError) throw new Error(chrome.runtime.lastError.message);
     return response;
   } catch (err) {
     throw new Error(`Связь со страницей: ${err.message}`);
@@ -86,14 +125,14 @@ async function runScenario(scenarioText) {
 
   const steps = parseScenario(scenarioText);
   if (steps.length === 0) {
-    statusDiv.innerHTML = '<div class="step error">Сценарий пуст</div>';
+    statusDiv.innerHTML = '<div class="step-card error"><span class="step-icon">❌</span><div class="step-content">Сценарий пуст</div></div>';
     runBtn.disabled = false;
     return;
   }
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) {
-    statusDiv.innerHTML = '<div class="step error">Нет активной вкладки</div>';
+    statusDiv.innerHTML = '<div class="step-card error"><span class="step-icon">❌</span><div class="step-content">Нет активной вкладки</div></div>';
     runBtn.disabled = false;
     return;
   }
@@ -101,44 +140,69 @@ async function runScenario(scenarioText) {
   try {
     await initModel();
   } catch (e) {
-    statusDiv.innerHTML = `<div class="step error">Не удалось загрузить модель: ${e.message}</div>`;
+    statusDiv.innerHTML = `<div class="step-card error"><span class="step-icon">❌</span><div class="step-content">Не удалось загрузить модель: ${e.message}</div></div>`;
     runBtn.disabled = false;
     return;
   }
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    const stepDiv = document.createElement('div');
-    stepDiv.className = 'step processing';
-    stepDiv.textContent = `⏳ ${step.action || 'Проверка: ' + step.expected}`;
-    statusDiv.appendChild(stepDiv);
-    stepDiv.scrollIntoView({ behavior: 'smooth' });
+    const card = document.createElement('div');
+    card.className = 'step-card processing';
+    card.innerHTML = `<span class="step-icon">⏳</span><div class="step-content"><div class="step-action">${step.action || 'Проверка: ' + step.expected}</div>${step.expected ? `<div class="expected-result">Ожидается: ${step.expected}</div>` : ''}</div>`;
+    statusDiv.appendChild(card);
+    card.scrollIntoView({ behavior: 'smooth' });
 
     try {
-      if (step.action) {
-        const targetVec = await getEmbedding(step.action);
-        const findRes = await sendMessageToTabSafely(tab.id, { type: 'FIND_ELEMENTS' });
+      // Если это проверка без действия
+      if (!step.type || !step.target) {
+        if (step.expected) {
+          await delay(1200);
+          const textRes = await sendMessageToTabSafely(tab.id, { type: 'GET_PAGE_TEXT' });
+          const pageText = textRes?.text || '';
+          if (!pageText) throw new Error('Не удалось получить текст страницы');
 
-        if (!findRes?.elements?.length) throw new Error('Интерактивных элементов не найдено');
-
-        let bestIndex = -1, bestScore = -Infinity;
-        for (const item of findRes.elements) {
-          const vec = await getEmbedding(item.text);
-          const score = cosineSimilarity(targetVec, vec);
-          if (score > bestScore) {
-            bestScore = score;
-            bestIndex = item.id;
+          const fragments = pageText.split('\n').filter(f => f.trim().length > 2);
+          const expectedVec = await getEmbedding(step.expected);
+          let maxSim = -1, bestFrag = '';
+          for (const frag of fragments) {
+            const fragVec = await getEmbedding(frag);
+            const sim = cosineSimilarity(expectedVec, fragVec);
+            if (sim > maxSim) { maxSim = sim; bestFrag = frag; }
           }
+          if (maxSim < 0.7) throw new Error(`Ожидаемый результат не подтверждён (лучшее: "${bestFrag}", сходство ${maxSim.toFixed(2)})`);
+          card.className = 'step-card success';
+          card.innerHTML = `<span class="step-icon">✅</span><div class="step-content"><div class="step-action">Проверка</div><div class="expected-result">✅ ${step.expected}</div></div>`;
         }
-
-        if (bestScore < 0.5) {
-          throw new Error(`Сходство ниже порога (${bestScore.toFixed(2)}). Элемент не найден`);
-        }
-
-        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_CLICK', index: bestIndex });
-        await delay(800);
+        continue;
       }
 
+      // Поиск элемента по цели
+      const targetVec = await getEmbedding(step.target);
+      const findRes = await sendMessageToTabSafely(tab.id, { type: 'FIND_ELEMENTS' });
+      if (!findRes?.elements?.length) throw new Error('Интерактивных элементов не найдено');
+
+      let bestIndex = -1, bestScore = -Infinity;
+      for (const item of findRes.elements) {
+        const vec = await getEmbedding(item.text);
+        const score = cosineSimilarity(targetVec, vec);
+        if (score > bestScore) { bestScore = score; bestIndex = item.id; }
+      }
+
+      if (bestScore < 0.45) throw new Error(`Сходство ниже порога (${bestScore.toFixed(2)}). Элемент не найден`);
+
+      // Выполнение действия
+      if (step.type === 'click') {
+        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_CLICK', index: bestIndex });
+      } else if (step.type === 'input') {
+        const value = step.value || '';
+        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_INPUT', index: bestIndex, value });
+      } else if (step.type === 'select') {
+        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_SELECT', index: bestIndex, value: step.value || '' });
+      }
+      await delay(800);
+
+      // Проверка результата, если есть
       if (step.expected) {
         await delay(1200);
         const textRes = await sendMessageToTabSafely(tab.id, { type: 'GET_PAGE_TEXT' });
@@ -148,26 +212,21 @@ async function runScenario(scenarioText) {
         const fragments = pageText.split('\n').filter(f => f.trim().length > 2);
         const expectedVec = await getEmbedding(step.expected);
         let maxSim = -1, bestFrag = '';
-
         for (const frag of fragments) {
           const fragVec = await getEmbedding(frag);
           const sim = cosineSimilarity(expectedVec, fragVec);
-          if (sim > maxSim) {
-            maxSim = sim;
-            bestFrag = frag;
-          }
+          if (sim > maxSim) { maxSim = sim; bestFrag = frag; }
         }
-
-        if (maxSim < 0.7) {
-          throw new Error(`Ожидаемый результат не подтверждён (лучшее: "${bestFrag}", сходство ${maxSim.toFixed(2)})`);
-        }
+        if (maxSim < 0.7) throw new Error(`Результат не подтверждён (лучшее: "${bestFrag}", сходство ${maxSim.toFixed(2)})`);
+        card.className = 'step-card success';
+        card.innerHTML = `<span class="step-icon">✅</span><div class="step-content"><div class="step-action">${step.action}</div><div class="expected-result">✅ ${step.expected}</div></div>`;
+      } else {
+        card.className = 'step-card success';
+        card.innerHTML = `<span class="step-icon">✅</span><div class="step-content"><div class="step-action">${step.action}</div></div>`;
       }
-
-      stepDiv.className = 'step success';
-      stepDiv.textContent = `✅ ${step.action || ''} ${step.expected ? '→ ' + step.expected : ''}`;
     } catch (err) {
-      stepDiv.className = 'step error';
-      stepDiv.textContent = `❌ ${step.action || 'Проверка'}: ${err.message}`;
+      card.className = 'step-card error';
+      card.innerHTML = `<span class="step-icon">❌</span><div class="step-content"><div class="step-action">${step.action || 'Проверка'}</div><div>${err.message}</div></div>`;
       break;
     }
   }

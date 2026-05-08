@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AI QA Assistant",
-  "version": "1.4",
-  "description": "Семантический запуск тестовых сценариев (RU/EN) – без воркеров",
+  "version": "1.5",
+  "description": "Семантический запуск тестовых сценариев (RU/EN) – без воркеров, с поддержкой ввода и выбора",
   "permissions": [
     "sidePanel",
     "activeTab",
