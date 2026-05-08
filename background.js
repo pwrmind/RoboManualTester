@@ -1,36 +1,50 @@
-// Импортируем напрямую из файла. 
-// Путь должен быть относительным и точным.
+// Импортируем библиотеку Transformers.js из локального файла
 import { pipeline, env } from './lib/transformers.min.js';
 
-// Настройки
-env.allowLocalModels = false;
-env.useBrowserCache = true;
+// Настройка окружения
+env.allowLocalModels = false;       // не используем локальные модели
+env.useBrowserCache = true;        // разрешаем кеширование в браузере
 
 let extractor = null;
 
+// Инициализация модели (мультиязычная, понимает русский)
 async function initModel() {
-    if (!extractor) {
-        console.log("Загрузка модели...");
-        try {
-            // Для русского языка
-            extractor = await pipeline('feature-extraction', 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', {
-                quantized: true
-            });
-            console.log("Модель готова!");
-        } catch (e) {
-            console.error("Ошибка инициализации:", e);
-        }
+  if (!extractor) {
+    console.log('Загрузка multilingual модели...');
+    try {
+      extractor = await pipeline(
+        'feature-extraction',
+        'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
+        { quantized: true } // квантизация для экономии памяти
+      );
+      console.log('Модель готова к работе');
+    } catch (err) {
+      console.error('Ошибка загрузки модели:', err);
+      extractor = null;
     }
+  }
 }
 
-// Слушаем сообщения
+// Обработчик сообщений от side panel
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'GET_EMBEDDING') {
-        initModel().then(async () => {
-            if (!extractor) return sendResponse({ error: "No model" });
-            const output = await extractor(message.text, { pooling: 'mean', normalize: true });
-            sendResponse({ embedding: Array.from(output.data) });
+  if (message.type === 'GET_EMBEDDING') {
+    (async () => {
+      await initModel();
+      if (!extractor) {
+        sendResponse({ error: 'Модель не загружена' });
+        return;
+      }
+      try {
+        const output = await extractor(message.text, {
+          pooling: 'mean',
+          normalize: true
         });
-        return true; 
-    }
+        // Возвращаем обычный массив чисел
+        sendResponse({ embedding: Array.from(output.data) });
+      } catch (e) {
+        sendResponse({ error: e.message });
+      }
+    })();
+    return true; // для асинхронного ответа
+  }
 });

@@ -1,28 +1,29 @@
 {
   "manifest_version": 3,
   "name": "AI QA Assistant",
-  "version": "1.0",
-  "description": "Автоматизация тестов на базе эмбеддингов (RU)",
+  "version": "1.4",
+  "description": "Семантический запуск тестовых сценариев (RU/EN) – без воркеров",
   "permissions": [
     "sidePanel",
     "activeTab",
     "scripting",
     "storage"
   ],
-  "host_permissions": [
-    "<all_urls>"
-  ],
+  "host_permissions": ["<all_urls>"],
   "side_panel": {
     "default_path": "sidepanel.html"
   },
   "action": {
-    "default_title": "Открыть панель тестировщика"
+    "default_title": "Открыть AI QA панель"
   },
-  "background": {
-  "service_worker": "background.js",
-  "type": "module"
-},
-"content_security_policy": {
-  "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-}
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_end"
+    }
+  ]
 }
