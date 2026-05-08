@@ -39,7 +39,52 @@ function cosineSimilarity(vecA, vecB) {
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-// Парсинг сценария с поддержкой различных действий
+// Улучшенный парсинг действия
+function parseActionLine(line) {
+  const patterns = [
+    { regex: /^(?:кликни|нажми|клик|перейди|открой|click|tap|press|open|go to)\s+(.+)/i, type: 'click' },
+    { regex: /^(?:введи|напиши|заполни|вставь|input|type|fill|enter)\s+(.+)/i, type: 'input' },
+    { regex: /^(?:выбери|отметь|select|choose|pick)\s+(.+)/i, type: 'select' }
+  ];
+
+  for (const { regex, type } of patterns) {
+    const match = line.match(regex);
+    if (match) {
+      let rest = match[1].trim();
+      let target = rest;
+      let value = null;
+      if (type === 'input' || type === 'select') {
+        // Ищем значение в кавычках (одинарных, двойных или бэктиках)
+        const quotedMatch = rest.match(/(['"«`])(.+?)\1/);
+        if (quotedMatch) {
+          value = quotedMatch[2]; // берём содержимое без кавычек
+          target = (rest.substring(0, quotedMatch.index) + rest.substring(quotedMatch.index + quotedMatch[0].length)).trim();
+        } else {
+          // Ищем разделитель "как", "значение", "текст", ":" и т.п.
+          const valueRegex = /\s+(?:как|значение|текст|value|text|:)\s+(.+)/i;
+          const valueMatch = rest.match(valueRegex);
+          if (valueMatch) {
+            value = valueMatch[1].trim();
+            target = rest.substring(0, valueMatch.index).trim();
+          } else {
+            // Если ничего не найдено, считаем последнее слово значением
+            const words = rest.split(/\s+/);
+            if (words.length > 1) {
+              value = words.pop();
+              target = words.join(' ');
+            }
+          }
+        }
+        // Убираем оставшиеся кавычки вокруг target на всякий случай
+        target = target.replace(/^['"«`]|['"»`]$/g, '');
+      }
+      return { action: line, type, target, value, expected: null };
+    }
+  }
+  // По умолчанию считаем кликом
+  return { action: line, type: 'click', target: line, value: null, expected: null };
+}
+
 function parseScenario(text) {
   const lines = text.split('\n').filter(line => line.trim() !== '');
   const steps = [];
@@ -47,7 +92,6 @@ function parseScenario(text) {
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    // Ожидаемый результат
     const resultMatch = line.match(/^(Результат|Result|Then|Ожидаемый результат)\s*[:：-]\s*(.+)/i);
     if (resultMatch) {
       const expected = resultMatch[2].trim();
@@ -60,51 +104,12 @@ function parseScenario(text) {
       }
       continue;
     }
-    // Если есть незавершённое действие, сохраняем его
     if (currentAction) steps.push(currentAction);
-
-    // Определяем тип действия и извлекаем цель/значение
     const actionObj = parseActionLine(line);
     currentAction = actionObj;
   }
   if (currentAction) steps.push(currentAction);
   return steps;
-}
-
-function parseActionLine(line) {
-  // Паттерны для русских и английских команд
-  const patterns = [
-    { regex: /^(?:кликни|нажми|клик|перейди|открой|click|tap|press|open|go to)\s+(.+)/i, type: 'click' },
-    { regex: /^(?:введи|напиши|заполни|вставь|input|type|fill|enter)\s+(.+)/i, type: 'input' },
-    { regex: /^(?:выбери|отметь|select|choose|pick)\s+(.+)/i, type: 'select' }
-  ];
-
-  for (const { regex, type } of patterns) {
-    const match = line.match(regex);
-    if (match) {
-      let target = match[1].trim();
-      let value = null;
-      if (type === 'input' || type === 'select') {
-        // Попытка выделить значение после слова-разделителя
-        const valueRegex = /\s+(?:как|значение|текст|value|text|:)\s+(.+)/i;
-        const valueMatch = target.match(valueRegex);
-        if (valueMatch) {
-          value = valueMatch[1].trim();
-          target = target.substring(0, valueMatch.index).trim();
-        } else {
-          // Если разделителя нет, считаем последнее слово значением
-          const words = target.split(/\s+/);
-          if (words.length > 1) {
-            value = words.pop();
-            target = words.join(' ');
-          }
-        }
-      }
-      return { action: line, type, target, value, expected: null };
-    }
-  }
-  // По умолчанию — клик
-  return { action: line, type: 'click', target: line, value: null, expected: null };
 }
 
 async function sendMessageToTabSafely(tabId, message) {
@@ -154,14 +159,13 @@ async function runScenario(scenarioText) {
     card.scrollIntoView({ behavior: 'smooth' });
 
     try {
-      // Если это проверка без действия
+      // Шаг только с ожидаемым результатом (проверка без действия)
       if (!step.type || !step.target) {
         if (step.expected) {
           await delay(1200);
           const textRes = await sendMessageToTabSafely(tab.id, { type: 'GET_PAGE_TEXT' });
           const pageText = textRes?.text || '';
           if (!pageText) throw new Error('Не удалось получить текст страницы');
-
           const fragments = pageText.split('\n').filter(f => f.trim().length > 2);
           const expectedVec = await getEmbedding(step.expected);
           let maxSim = -1, bestFrag = '';
@@ -195,14 +199,14 @@ async function runScenario(scenarioText) {
       if (step.type === 'click') {
         await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_CLICK', index: bestIndex });
       } else if (step.type === 'input') {
-        const value = step.value || '';
-        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_INPUT', index: bestIndex, value });
+        const valueToSend = step.value || '';
+        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_INPUT', index: bestIndex, value: valueToSend });
       } else if (step.type === 'select') {
         await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_SELECT', index: bestIndex, value: step.value || '' });
       }
       await delay(800);
 
-      // Проверка результата, если есть
+      // Проверка результата
       if (step.expected) {
         await delay(1200);
         const textRes = await sendMessageToTabSafely(tab.id, { type: 'GET_PAGE_TEXT' });

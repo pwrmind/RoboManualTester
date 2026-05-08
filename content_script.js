@@ -27,21 +27,32 @@ const INTERACTIVE_SELECTORS = [
   '[contenteditable="true"]'
 ];
 
+/**
+ * Возвращает отфильтрованный список элементов (только с непустым текстом) 
+ * в том же порядке, что и в FIND_ELEMENTS.
+ */
+function getFilteredElements() {
+  const elements = document.querySelectorAll(INTERACTIVE_SELECTORS.join(','));
+  return Array.from(elements).map((el, index) => ({
+    id: index,
+    el,
+    text: (el.innerText || el.value || el.placeholder || el.ariaLabel || '').trim(),
+    tag: el.tagName.toLowerCase(),
+    type: el.type || ''
+  })).filter(item => item.text.length > 0);
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'FIND_ELEMENTS') {
-    const elements = document.querySelectorAll(INTERACTIVE_SELECTORS.join(','));
-    const data = Array.from(elements).map((el, index) => ({
-      id: index,
-      text: (el.innerText || el.value || el.placeholder || el.ariaLabel || '').trim(),
-      tag: el.tagName.toLowerCase(),
-      type: el.type || ''
-    })).filter(item => item.text.length > 0);
+    const filtered = getFilteredElements();
+    const data = filtered.map(({id, text, tag, type}) => ({ id, text, tag, type }));
     sendResponse({ elements: data });
   }
   else if (request.type === 'EXECUTE_CLICK') {
-    const elements = document.querySelectorAll(INTERACTIVE_SELECTORS.join(','));
-    const el = elements[request.index];
-    if (el) {
+    const filtered = getFilteredElements();
+    const item = filtered.find(el => el.id === request.index);
+    if (item) {
+      const el = item.el;
       // Сбрасываем предыдущие подсветки
       document.querySelectorAll('[data-ai-highlight]').forEach(e => {
         e.style.outline = '';
@@ -57,44 +68,43 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
   }
   else if (request.type === 'EXECUTE_INPUT') {
-    const elements = document.querySelectorAll(INTERACTIVE_SELECTORS.join(','));
-    const el = elements[request.index];
-    if (el) {
-      document.querySelectorAll('[data-ai-highlight]').forEach(e => {
-        e.style.outline = '';
-        e.removeAttribute('data-ai-highlight');
-      });
-      el.style.outline = '3px solid #b388ff';
-      el.setAttribute('data-ai-highlight', 'true');
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      el.focus();
-      // Очищаем и вводим значение
-      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-        el.value = '';
-        // Имитация набора текста для реактивных фреймворков
-        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, 'value'
-        ).set;
-        nativeInputValueSetter.call(el, request.value);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      } else if (el.getAttribute('contenteditable') === 'true') {
-        el.textContent = request.value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      sendResponse({ success: true });
-    } else {
-      sendResponse({ success: false, error: 'Элемент не найден' });
+    const filtered = getFilteredElements();
+    const item = filtered.find(el => el.id === request.index);
+    if (!item) return sendResponse({ success: false, error: 'Элемент не найден' });
+    const el = item.el;
+    // Сбрасываем подсветки
+    document.querySelectorAll('[data-ai-highlight]').forEach(e => {
+      e.style.outline = '';
+      e.removeAttribute('data-ai-highlight');
+    });
+    el.style.outline = '3px solid #b388ff';
+    el.setAttribute('data-ai-highlight', 'true');
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.focus();
+    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+      // Очищаем поле и вводим новое значение через нативный сеттер
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value'
+      ).set;
+      nativeSetter.call(el, '');
+      nativeSetter.call(el, request.value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } else if (el.getAttribute('contenteditable') === 'true') {
+      el.textContent = request.value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
     }
+    sendResponse({ success: true });
   }
   else if (request.type === 'EXECUTE_SELECT') {
-    const elements = document.querySelectorAll(INTERACTIVE_SELECTORS.join(','));
-    const el = elements[request.index];
-    if (!el) return sendResponse({ success: false, error: 'Элемент не найден' });
+    const filtered = getFilteredElements();
+    const item = filtered.find(el => el.id === request.index);
+    if (!item) return sendResponse({ success: false, error: 'Элемент не найден' });
+    const el = item.el;
     if (el.tagName === 'SELECT') {
-      // Ищем опцию, текст которой семантически ближе к request.value
       const options = Array.from(el.options);
-      let bestOption = null, bestScore = -Infinity;
-      // Здесь можно было бы использовать эмбеддинги, но для простоты воспользуемся includes
+      let bestOption = null;
+      // Ищем опцию, содержащую нужное значение (без учёта регистра)
       for (const opt of options) {
         if (opt.text.toLowerCase().includes(request.value.toLowerCase())) {
           bestOption = opt;
@@ -109,7 +119,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: false, error: 'Подходящая опция не найдена' });
       }
     } else {
-      // Кастомный селект – кликнем по элементу, а затем по опции
+      // Для кастомных селектов просто делаем клик
       el.click();
       sendResponse({ success: true, note: 'Для кастомного селекта выполнен клик, выбор опции не гарантирован' });
     }
