@@ -24,7 +24,8 @@ const INTERACTIVE_SELECTORS = [
   'input:not([type])', // input без типа считается текстовым
   'textarea',
   'select',
-  '[contenteditable="true"]'
+  '[contenteditable="true"]',
+  '[inputmode="text"]'
 ];
 
 /**
@@ -45,11 +46,14 @@ function getFilteredElements() {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'FIND_ELEMENTS') {
     const filtered = getFilteredElements();
+    // Сохраняем найденные элементы в глобальной переменной, чтобы индексы не «плыли»
+    window.__aiFilteredElements = filtered;
     const data = filtered.map(({id, text, tag, type}) => ({ id, text, tag, type }));
     sendResponse({ elements: data });
   }
   else if (request.type === 'EXECUTE_CLICK') {
-    const filtered = getFilteredElements();
+    // Используем сохранённый список, если он есть, иначе ищем заново
+    const filtered = window.__aiFilteredElements || getFilteredElements();
     const item = filtered.find(el => el.id === request.index);
     if (item) {
       const el = item.el;
@@ -68,7 +72,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
   }
   else if (request.type === 'EXECUTE_INPUT') {
-    const filtered = getFilteredElements();
+    const filtered = window.__aiFilteredElements || getFilteredElements();
     const item = filtered.find(el => el.id === request.index);
     if (!item) return sendResponse({ success: false, error: 'Элемент не найден' });
     const el = item.el;
@@ -82,22 +86,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     el.focus();
     if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-      // Очищаем поле и вводим новое значение через нативный сеттер
+      // Нативный сеттер + события для фреймворков
       const nativeSetter = Object.getOwnPropertyDescriptor(
         window.HTMLInputElement.prototype, 'value'
       ).set;
-      nativeSetter.call(el, '');
       nativeSetter.call(el, request.value);
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      // Blur часто требуется для активации валидации
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
     } else if (el.getAttribute('contenteditable') === 'true') {
       el.textContent = request.value;
       el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
     }
     sendResponse({ success: true });
   }
   else if (request.type === 'EXECUTE_SELECT') {
-    const filtered = getFilteredElements();
+    const filtered = window.__aiFilteredElements || getFilteredElements();
     const item = filtered.find(el => el.id === request.index);
     if (!item) return sendResponse({ success: false, error: 'Элемент не найден' });
     const el = item.el;

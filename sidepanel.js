@@ -41,33 +41,38 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // Улучшенный парсинг действия
 function parseActionLine(line) {
+  // Удаляем нумерацию в начале строки (1., 1.1., 1.1.1. и т.п.)
+  const cleanLine = line.replace(/^(\d+\.)+\s*/, '').trim();
+  if (!cleanLine) return null;
+
   const patterns = [
     { regex: /^(?:кликни|нажми|клик|перейди|открой|click|tap|press|open|go to)\s+(.+)/i, type: 'click' },
     { regex: /^(?:введи|напиши|заполни|вставь|input|type|fill|enter)\s+(.+)/i, type: 'input' },
-    { regex: /^(?:выбери|отметь|select|choose|pick)\s+(.+)/i, type: 'select' }
+    { regex: /^(?:выбери|отметь|select|choose|pick)\s+(.+)/i, type: 'select' },
+    { regex: /^(?:проверь|убедись|verify|check|see|assert)\s+(.+)/i, type: 'verify' }
   ];
 
   for (const { regex, type } of patterns) {
-    const match = line.match(regex);
+    const match = cleanLine.match(regex);
     if (match) {
       let rest = match[1].trim();
       let target = rest;
       let value = null;
       if (type === 'input' || type === 'select') {
-        // Ищем значение в кавычках (одинарных, двойных или бэктиках)
-        const quotedMatch = rest.match(/(['"«`])(.+?)\1/);
+        // Ищем значение в кавычках (одинарных, двойных или «»)
+        const quotedMatch = rest.match(/[«""'](.*?)[»""']/);
         if (quotedMatch) {
-          value = quotedMatch[2]; // берём содержимое без кавычек
+          value = quotedMatch[1];
           target = (rest.substring(0, quotedMatch.index) + rest.substring(quotedMatch.index + quotedMatch[0].length)).trim();
         } else {
-          // Ищем разделитель "как", "значение", "текст", ":" и т.п.
+          // Разделители: "как", "значение", "текст", ":", etc.
           const valueRegex = /\s+(?:как|значение|текст|value|text|:)\s+(.+)/i;
           const valueMatch = rest.match(valueRegex);
           if (valueMatch) {
             value = valueMatch[1].trim();
             target = rest.substring(0, valueMatch.index).trim();
           } else {
-            // Если ничего не найдено, считаем последнее слово значением
+            // Если ничего не найдено, последнее слово считаем значением
             const words = rest.split(/\s+/);
             if (words.length > 1) {
               value = words.pop();
@@ -75,16 +80,16 @@ function parseActionLine(line) {
             }
           }
         }
-        // Убираем оставшиеся кавычки вокруг target на всякий случай
-        target = target.replace(/^['"«`]|['"»`]$/g, '');
+        target = target.replace(/^[«""']|[»""']$/g, '');
       }
-      return { action: line, type, target, value, expected: null };
+      return { action: cleanLine, type, target, value, expected: null };
     }
   }
-  // По умолчанию считаем кликом
-  return { action: line, type: 'click', target: line, value: null, expected: null };
+  // По умолчанию — клик
+  return { action: cleanLine, type: 'click', target: cleanLine, value: null, expected: null };
 }
 
+// Парсинг всего сценария
 function parseScenario(text) {
   const lines = text.split('\n').filter(line => line.trim() !== '');
   const steps = [];
@@ -92,21 +97,29 @@ function parseScenario(text) {
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    const resultMatch = line.match(/^(Результат|Result|Then|Ожидаемый результат)\s*[:：-]\s*(.+)/i);
+    // Поддержка русских и английских маркеров ожидаемого результата
+    const resultMatch = line.match(/^(?:Результат|Result|Then|Ожидаемый результат|Expected result)\s*[:：-]\s*(.+)/i);
     if (resultMatch) {
-      const expected = resultMatch[2].trim();
+      const expected = resultMatch[1].trim();
       if (currentAction) {
         currentAction.expected = expected;
         steps.push(currentAction);
         currentAction = null;
       } else {
-        steps.push({ action: null, type: null, target: null, value: null, expected });
+        // Только проверка без действия
+        steps.push({ action: 'Проверка: ' + expected, type: 'verify', target: null, value: null, expected });
       }
       continue;
     }
-    if (currentAction) steps.push(currentAction);
-    const actionObj = parseActionLine(line);
-    currentAction = actionObj;
+    // Если предыдущее действие не закрыто результатом, сохраняем его
+    if (currentAction) {
+      steps.push(currentAction);
+      currentAction = null;
+    }
+    const parsed = parseActionLine(line);
+    if (parsed) {
+      currentAction = parsed;
+    }
   }
   if (currentAction) steps.push(currentAction);
   return steps;
@@ -160,7 +173,7 @@ async function runScenario(scenarioText) {
 
     try {
       // Шаг только с ожидаемым результатом (проверка без действия)
-      if (!step.type || !step.target) {
+      if (!step.type || step.type === 'verify' || !step.target) {
         if (step.expected) {
           await delay(1200);
           const textRes = await sendMessageToTabSafely(tab.id, { type: 'GET_PAGE_TEXT' });
