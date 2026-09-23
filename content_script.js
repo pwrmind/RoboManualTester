@@ -86,7 +86,11 @@
     const rawText = (el.innerText || el.textContent || '').trim();
     const aria = el.getAttribute('aria-label') || '';
     const title = el.getAttribute('title') || '';
-    const placeholder = el.getAttribute('placeholder') || '';
+    const placeholder =
+      el.getAttribute('placeholder') ||
+      el.getAttribute('data-placeholder') ||
+      el.getAttribute('aria-placeholder') ||
+      '';
     const alt = el.getAttribute('alt') || '';
     const label = getLabelText(el);
 
@@ -124,16 +128,132 @@
     document.querySelectorAll(`[${HIGHLIGHT_ATTR}]`).forEach(e => {
       e.style.outline = '';
       e.style.outlineOffset = '';
+      e.style.transition = '';
       e.removeAttribute(HIGHLIGHT_ATTR);
     });
   }
 
-  function highlight(el, color = '#b388ff') {
+  function highlight(el, color = '#b388ff', { holdMs = 2000, fadeMs = 500 } = {}) {
     clearHighlights();
+
+    el.style.transition = 'none';
     el.style.outline = `3px solid ${color}`;
     el.style.outlineOffset = '2px';
     el.setAttribute(HIGHLIGHT_ATTR, '1');
+
+    void el.offsetWidth;
+
     try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch {}
+
+    el.style.transition = `outline-color ${fadeMs}ms ease-out`;
+
+    setTimeout(() => {
+      if (!el.getAttribute(HIGHLIGHT_ATTR)) return;
+      el.style.outlineColor = 'transparent';
+      setTimeout(() => {
+        if (!el.getAttribute(HIGHLIGHT_ATTR)) return;
+        el.style.outline = '';
+        el.style.outlineOffset = '';
+        el.style.transition = '';
+        el.removeAttribute(HIGHLIGHT_ATTR);
+      }, fadeMs + 60);
+    }, holdMs);
+  }
+
+  // ---------- contenteditable insertion ----------
+
+  // Возвращает true, если значение «похоже» уже находится в элементе ровно один раз.
+  // Учитывает, что rich-редакторы разбивают текст на несколько спанов и рендерят эмодзи
+  // как декораторы (их нет в textContent).
+  function countProbe(text, value) {
+    const a = String(text || '').replace(/\s+/g, ' ').trim();
+    // Первые 15 code points значения — этого достаточно, чтобы отличить
+    // «вставлено», «не вставлено» и «вставлено дважды».
+    const probe = Array.from(String(value || '').replace(/\s+/g, ' ').trim()).slice(0, 15).join('');
+    if (!probe) return { count: 1, probe };
+    // Используем нежадный split: считаем все вхождения probe в a.
+    let count = 0;
+    let idx = 0;
+    while ((idx = a.indexOf(probe, idx)) !== -1) {
+      count++;
+      idx += probe.length;
+    }
+    return { count, probe };
+  }
+
+  // Пытаемся заменить текущее выделение синтетическим beforeinput.
+  // Синтетическое событие не имеет default action, поэтому браузер сам ничего не вставит
+  // — вставку выполняет обработчик редактора (Lexical / ProseMirror / Slate).
+  function dispatchBeforeInput(el, value) {
+    const evt = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'insertText',
+      data: value
+    });
+    el.dispatchEvent(evt);
+  }
+
+  function dispatchPaste(el, value) {
+    const dt = new DataTransfer();
+    dt.setData('text/plain', value);
+    const evt = new ClipboardEvent('paste', {
+      bubbles: true,
+      cancelable: true
+    });
+    // clipboardData конструктором не выставляется в свежих Chrome — определяем вручную.
+    try { Object.defineProperty(evt, 'clipboardData', { value: dt }); } catch {}
+    el.dispatchEvent(evt);
+  }
+
+  async function insertIntoContentEditable(el, value) {
+    el.focus();
+
+    // Выделяем текущее содержимое, чтобы вставка заменила его, а не дописала.
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+
+    // Попытка 1: beforeinput — предпочтительный путь для Lexical и подобных.
+    dispatchBeforeInput(el, value);
+    await sleep(120);
+
+    let text = el.textContent || '';
+    let { count } = countProbe(text, value);
+    if (count === 1) return { ok: true, actual: text.trim() };
+
+    // Попытка 2: paste — на случай, если редактор слушает только вставку.
+    // Сначала заново выделяем содержимое, чтобы не дописать к уже вставленному.
+    if (count === 0) {
+      const r2 = document.createRange();
+      r2.selectNodeContents(el);
+      const s2 = window.getSelection();
+      s2?.removeAllRanges();
+      s2?.addRange(r2);
+      dispatchPaste(el, value);
+      await sleep(160);
+
+      text = el.textContent || '';
+      count = countProbe(text, value).count;
+      if (count === 1) return { ok: true, actual: text.trim() };
+    }
+
+    if (count === 0) {
+      throw new Error(
+        `contenteditable не принял текст. Ожидалось "${value.slice(0, 40)}…", ` +
+        `в элементе "${text.trim().slice(0, 80)}".`
+      );
+    }
+    if (count > 1) {
+      throw new Error(
+        `Редактор вставил текст ${count} раз вместо одного. ` +
+        `В элементе "${text.trim().slice(0, 120)}". Это внутренняя проблема редактора, ` +
+        `сообщите, пожалуйста, разработчику расширения.`
+      );
+    }
+    return { ok: true, actual: text.trim() };
   }
 
   // ---------- operations ----------
@@ -172,7 +292,7 @@
       if (isCovered(el)) {
         throw new Error(
           `Элемент ${el.tagName.toLowerCase()} перекрыт другим — вероятно, это скрытый «зеркальный» узел. ` +
-          `Похоже, настоящий input рядом. Уточните формулировку цели, чтобы матч попал в видимый элемент.`
+          `Уточните формулировку цели, чтобы матч попал в видимый элемент.`
         );
       }
       if (!isEditable(el)) {
@@ -184,33 +304,7 @@
       const value = String(payload ?? '');
 
       if (el.isContentEditable) {
-        el.focus();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        const sel = window.getSelection();
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-
-        let inserted = false;
-        try { inserted = document.execCommand('insertText', false, value); } catch {}
-
-        if (!inserted) {
-          el.textContent = value;
-          el.dispatchEvent(new InputEvent('input', {
-            bubbles: true, cancelable: true, inputType: 'insertText', data: value
-          }));
-        }
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-
-        await sleep(120);
-        const actual = (el.textContent || '').trim();
-        if (actual !== value) {
-          throw new Error(
-            `contenteditable не принял текст. В элементе: "${actual.slice(0, 80)}". ` +
-            `Возможно, редактор реагирует только на клавиатурные события.`
-          );
-        }
-        return { ok: true, actual };
+        return await insertIntoContentEditable(el, value);
       }
 
       const proto =
@@ -287,8 +381,6 @@
     });
   }
 
-  // ---------- message dispatch ----------
-
   chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     try {
       if (msg.method === 'PING')     return void sendResponse({ ok: true });
@@ -297,7 +389,7 @@
       if (msg.method === 'HIGHLIGHT') {
         const el = registry.get(msg.params.id);
         if (!el) return void sendResponse({ ok: false, error: 'Нет такого id' });
-        highlight(el, msg.params.color || '#b388ff');
+        highlight(el, msg.params.color || '#b388ff', msg.params.options || {});
         return void sendResponse({ ok: true });
       }
       if (msg.method === 'PERFORM') {

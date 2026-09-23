@@ -1,7 +1,6 @@
 // sidepanel.js
 'use strict';
 
-// ---------- DOM ----------
 const $scenario = document.getElementById('scenario');
 const $run = document.getElementById('runBtn');
 const $cancel = document.getElementById('cancelBtn');
@@ -9,8 +8,8 @@ const $status = document.getElementById('status');
 
 let cancelled = false;
 
-// ---------- parser ----------
-// ВАЖНО: без \b — он не работает для кириллицы. Разделитель — только \s+.
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
 const ACTIONS = [
   { type: 'click',  re: /^(?:нажми|нажать|кликни|кликнуть|клик|тыкни|ткни|перейди|перейти|открой|открыть|click|tap|press|open|go to|visit)\s+(.+)/i },
   { type: 'input',  re: /^(?:введи|ввести|напиши|написать|заполни|заполнить|вставь|вставить|input|type|fill|enter)\s+(.+)/i },
@@ -18,65 +17,94 @@ const ACTIONS = [
   { type: 'verify', re: /^(?:проверь|проверить|убедись|убедиться|verify|check|assert|expect)\s+(.+)/i }
 ];
 
+const WAIT_RE         = /^(?:подожди|подождать|ждать|пауза|сделай\s+паузу|wait|sleep|pause)\s+(\d+(?:[.,]\d+)?)\s*(?:секунд[аыу]?|сек|s|second[s]?)?\s*$/i;
 const EXPECT_RE       = /^(?:результат|ожидаемый результат|result|expected result|then)\s*[:：-]\s*(.+)/i;
 const VALUE_MARKER_RE = /\s+(?:значение|сообщение|текст|value|text)\s*[:=]?\s+(.+)$/i;
 const FIELD_PREFIX_RE = /^(?:в\s+поле|поле|field|into)\s+(.+)$/i;
-const QUOTED_RE       = /["'«»""](.+?)["'«»""]/;
 
 function stripQuotes(s) {
   return String(s ?? '').replace(/^[\s"'«»"""'']+|[\s"'«»"""'']+$/g, '').trim();
+}
+
+function extractQuoted(s) {
+  const out = [];
+  const re = /["'«»""]([^"'«»""]+)["'«»""]/g;
+  let m;
+  while ((m = re.exec(s)) !== null) out.push(m[1]);
+  return out;
+}
+
+function stripPrepositions(s) {
+  const PREP = /^(?:по|на|в|к|для|от|из|у|с|about|on|to|in|at|the)\s+/i;
+  const NOUN = /^(?:кнопк[аеуи]?|ссылк[аеуи]?|поле|пункт[аеуи]?|элемент[аеуи]?|button|link|field|item)\s+/i;
+  let out = String(s ?? '').trim();
+  let prev;
+  do {
+    prev = out;
+    out = out.replace(PREP, '').replace(NOUN, '').trim();
+  } while (out !== prev && out.length);
+  return out;
+}
+
+function extractTarget(rest) {
+  const quoted = extractQuoted(rest);
+  if (quoted.length >= 1) return stripQuotes(quoted[0]);
+  return stripQuotes(stripPrepositions(rest));
 }
 
 function splitTargetValue(rest) {
   let work = rest.trim();
   let value = null;
 
-  const v = work.match(VALUE_MARKER_RE);
-  if (v) {
-    value = stripQuotes(v[1]);
-    work  = work.slice(0, v.index).trim();
+  const vm = work.match(VALUE_MARKER_RE);
+  if (vm) {
+    value = stripQuotes(vm[1]);
+    work  = work.slice(0, vm.index).trim();
   }
 
-  const f = work.match(FIELD_PREFIX_RE);
-  if (f) {
-    const body = f[1].trim();
-    const q = body.match(QUOTED_RE);
-    if (q) {
-      const target = stripQuotes(q[1]);
-      const after = body.slice(q.index + q[0].length).trim();
-      if (value === null && after) value = stripQuotes(after);
-      return { target, value };
+  const fp = work.match(FIELD_PREFIX_RE);
+  if (fp) work = fp[1].trim();
+
+  const quoted = extractQuoted(work);
+  if (quoted.length >= 2) {
+    return { target: stripQuotes(quoted[0]), value: stripQuotes(quoted[1]) };
+  }
+  if (quoted.length === 1) {
+    const q = quoted[0];
+    const idx = work.indexOf(q);
+    const before = stripPrepositions(work.slice(0, Math.max(0, idx - 1)));
+    const after  = work.slice(idx + q.length + 1).trim();
+
+    if (value === null && before) {
+      return { target: stripQuotes(before), value: stripQuotes(q) };
     }
-    if (value !== null) return { target: stripQuotes(body), value };
-    const words = body.split(/\s+/);
-    if (words.length >= 2) {
-      const v2 = words.pop();
-      return { target: words.join(' '), value: stripQuotes(v2) };
+    if (value === null && after) {
+      return { target: stripQuotes(q), value: stripQuotes(after) };
     }
-    return { target: stripQuotes(body), value: null };
+    return { target: stripQuotes(q), value };
   }
 
-  const q = work.match(QUOTED_RE);
-  if (q && value === null) {
-    value = stripQuotes(q[1]);
-    work  = (work.slice(0, q.index) + work.slice(q.index + q[0].length)).trim();
-    return { target: stripQuotes(work), value };
-  }
-
+  const target = stripQuotes(stripPrepositions(work));
   if (value === null) {
-    const words = work.split(/\s+/);
+    const words = target.split(/\s+/).filter(Boolean);
     if (words.length >= 2) {
-      const v2 = words.pop();
-      value = stripQuotes(v2);
-      work  = words.join(' ');
+      const last = words.pop();
+      return { target: stripQuotes(words.join(' ')), value: stripQuotes(last) };
     }
   }
-  return { target: stripQuotes(work), value };
+  return { target, value };
 }
 
 function parseLine(line) {
   const clean = line.replace(/^\s*(?:\d+\.)+\s*/, '').trim();
   if (!clean) return null;
+
+  const wm = clean.match(WAIT_RE);
+  if (wm) {
+    const sec = parseFloat(wm[1].replace(',', '.'));
+    return { action: clean, type: 'wait', target: null, value: sec, expected: null };
+  }
+
   for (const { type, re } of ACTIONS) {
     const m = clean.match(re);
     if (!m) continue;
@@ -85,7 +113,7 @@ function parseLine(line) {
       const { target, value } = splitTargetValue(rest);
       return { action: clean, type, target, value };
     }
-    return { action: clean, type, target: stripQuotes(rest), value: null };
+    return { action: clean, type, target: extractTarget(rest), value: null };
   }
   return { action: clean, type: 'click', target: clean, value: null };
 }
@@ -117,8 +145,6 @@ function parseScenario(text) {
   return steps;
 }
 
-// ---------- resolver ----------
-
 function normalize(s) {
   return String(s ?? '')
     .replace(/\u00a0/g, ' ')
@@ -145,6 +171,7 @@ function scoreCandidate(target, el) {
   let best = 0;
   for (const v of variants) {
     if (v === t) { best = Math.max(best, 1); continue; }
+    if (v.startsWith(t)) { best = Math.max(best, 0.95); continue; }
     if (v.includes(t)) { best = Math.max(best, 0.9); continue; }
     if (t.includes(v) && v.length >= 3) { best = Math.max(best, 0.75); continue; }
     best = Math.max(best, tokenScore(t, v) * 0.85);
@@ -158,8 +185,6 @@ function resolveTarget(target, elements) {
     .map(el => ({ el, score: scoreCandidate(target, el) }))
     .sort((a, b) => b.score - a.score);
 }
-
-// ---------- transport ----------
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -177,8 +202,6 @@ function tabCall(tabId, method, params) {
     });
   });
 }
-
-// ---------- UI ----------
 
 function addCard(step) {
   const card = document.createElement('div');
@@ -214,8 +237,6 @@ function elLabel(el) {
   return `<${t}${ty}>`;
 }
 
-// ---------- runner ----------
-
 async function run() {
   cancelled = false;
   $run.disabled = true;
@@ -248,6 +269,13 @@ async function run() {
     const { card, detail } = addCard(step);
 
     try {
+      if (step.type === 'wait') {
+        const sec = Number.isFinite(step.value) ? step.value : 1;
+        await delay(sec * 1000);
+        setOk(card, detail, `Пауза ${sec} сек`);
+        continue;
+      }
+
       if (step.type === 'verify' || !step.target) {
         if (!step.expected) { setOk(card, detail, 'Пропущено'); continue; }
         await verifyExpected(tab.id, step.expected);
@@ -274,7 +302,6 @@ async function run() {
         throw new Error(`Неоднозначная цель, уточните формулировку:\n${near}`);
       }
 
-      // подсветить найденный элемент, чтобы пользователь видел, во что попал матч
       try { await tabCall(tab.id, 'HIGHLIGHT', { id: top.el.id, color: '#b388ff' }); } catch {}
 
       detail.textContent = `Цель: ${elLabel(top.el)} ${top.el.signature.slice(0, 100)} (${top.score.toFixed(2)})`;
@@ -286,7 +313,7 @@ async function run() {
       });
 
       if (step.type === 'input') {
-        detail.textContent = `Записано в ${elLabel(top.el)}: "${res.result?.actual ?? ''}"`;
+        detail.textContent = `Записано в ${elLabel(top.el)}: "${String(res.result?.actual ?? '').slice(0, 100)}"`;
       } else if (step.type === 'select' && res.result?.actual != null) {
         detail.textContent = `Выбрано в ${elLabel(top.el)}: "${res.result.actual}"`;
       } else {
@@ -329,8 +356,6 @@ function resetButtons() {
   $run.disabled = false;
   $cancel.disabled = true;
 }
-
-// ---------- wire up ----------
 
 $run.addEventListener('click', run);
 $cancel.addEventListener('click', () => { cancelled = true; });
