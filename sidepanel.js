@@ -1,256 +1,336 @@
-import { pipeline, env } from './lib/transformers.min.js';
+// sidepanel.js
+'use strict';
 
-env.allowLocalModels = false;
-env.useBrowserCache = true;
-if (env.backends?.onnx?.wasm) {
-  env.backends.onnx.wasm.proxy = false;
-  env.backends.onnx.wasm.numThreads = 1;
+// ---------- DOM ----------
+const $scenario = document.getElementById('scenario');
+const $run = document.getElementById('runBtn');
+const $cancel = document.getElementById('cancelBtn');
+const $status = document.getElementById('status');
+
+let cancelled = false;
+
+// ---------- parser ----------
+// ВАЖНО: без \b — он не работает для кириллицы. Разделитель — только \s+.
+const ACTIONS = [
+  { type: 'click',  re: /^(?:нажми|нажать|кликни|кликнуть|клик|тыкни|ткни|перейди|перейти|открой|открыть|click|tap|press|open|go to|visit)\s+(.+)/i },
+  { type: 'input',  re: /^(?:введи|ввести|напиши|написать|заполни|заполнить|вставь|вставить|input|type|fill|enter)\s+(.+)/i },
+  { type: 'select', re: /^(?:выбери|выбрать|отметь|отметить|select|choose|pick)\s+(.+)/i },
+  { type: 'verify', re: /^(?:проверь|проверить|убедись|убедиться|verify|check|assert|expect)\s+(.+)/i }
+];
+
+const EXPECT_RE       = /^(?:результат|ожидаемый результат|result|expected result|then)\s*[:：-]\s*(.+)/i;
+const VALUE_MARKER_RE = /\s+(?:значение|сообщение|текст|value|text)\s*[:=]?\s+(.+)$/i;
+const FIELD_PREFIX_RE = /^(?:в\s+поле|поле|field|into)\s+(.+)$/i;
+const QUOTED_RE       = /["'«»""](.+?)["'«»""]/;
+
+function stripQuotes(s) {
+  return String(s ?? '').replace(/^[\s"'«»"""'']+|[\s"'«»"""'']+$/g, '').trim();
 }
 
-let extractor = null;
+function splitTargetValue(rest) {
+  let work = rest.trim();
+  let value = null;
 
-async function initModel() {
-  if (!extractor) {
-    console.log('Загрузка мультиязычной модели...');
-    extractor = await pipeline(
-      'feature-extraction',
-      'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
-      { quantized: true }
-    );
-    console.log('Модель готова');
+  const v = work.match(VALUE_MARKER_RE);
+  if (v) {
+    value = stripQuotes(v[1]);
+    work  = work.slice(0, v.index).trim();
   }
-}
 
-async function getEmbedding(text) {
-  await initModel();
-  const output = await extractor(text, { pooling: 'mean', normalize: true });
-  return Array.from(output.data);
-}
-
-function cosineSimilarity(vecA, vecB) {
-  let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < vecA.length; i++) {
-    dot += vecA[i] * vecB[i];
-    normA += vecA[i] * vecA[i];
-    normB += vecB[i] * vecB[i];
+  const f = work.match(FIELD_PREFIX_RE);
+  if (f) {
+    const body = f[1].trim();
+    const q = body.match(QUOTED_RE);
+    if (q) {
+      const target = stripQuotes(q[1]);
+      const after = body.slice(q.index + q[0].length).trim();
+      if (value === null && after) value = stripQuotes(after);
+      return { target, value };
+    }
+    if (value !== null) return { target: stripQuotes(body), value };
+    const words = body.split(/\s+/);
+    if (words.length >= 2) {
+      const v2 = words.pop();
+      return { target: words.join(' '), value: stripQuotes(v2) };
+    }
+    return { target: stripQuotes(body), value: null };
   }
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
 
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const q = work.match(QUOTED_RE);
+  if (q && value === null) {
+    value = stripQuotes(q[1]);
+    work  = (work.slice(0, q.index) + work.slice(q.index + q[0].length)).trim();
+    return { target: stripQuotes(work), value };
+  }
 
-// Улучшенный парсинг действия
-function parseActionLine(line) {
-  // Удаляем нумерацию в начале строки (1., 1.1., 1.1.1. и т.п.)
-  const cleanLine = line.replace(/^(\d+\.)+\s*/, '').trim();
-  if (!cleanLine) return null;
-
-  const patterns = [
-    { regex: /^(?:кликни|нажми|клик|перейди|открой|click|tap|press|open|go to)\s+(.+)/i, type: 'click' },
-    { regex: /^(?:введи|напиши|заполни|вставь|input|type|fill|enter)\s+(.+)/i, type: 'input' },
-    { regex: /^(?:выбери|отметь|select|choose|pick)\s+(.+)/i, type: 'select' },
-    { regex: /^(?:проверь|убедись|verify|check|see|assert)\s+(.+)/i, type: 'verify' }
-  ];
-
-  for (const { regex, type } of patterns) {
-    const match = cleanLine.match(regex);
-    if (match) {
-      let rest = match[1].trim();
-      let target = rest;
-      let value = null;
-      if (type === 'input' || type === 'select') {
-        // Ищем значение в кавычках (одинарных, двойных или «»)
-        const quotedMatch = rest.match(/[«""'](.*?)[»""']/);
-        if (quotedMatch) {
-          value = quotedMatch[1];
-          target = (rest.substring(0, quotedMatch.index) + rest.substring(quotedMatch.index + quotedMatch[0].length)).trim();
-        } else {
-          // Разделители: "как", "значение", "текст", ":", etc.
-          const valueRegex = /\s+(?:как|значение|текст|value|text|:)\s+(.+)/i;
-          const valueMatch = rest.match(valueRegex);
-          if (valueMatch) {
-            value = valueMatch[1].trim();
-            target = rest.substring(0, valueMatch.index).trim();
-          } else {
-            // Если ничего не найдено, последнее слово считаем значением
-            const words = rest.split(/\s+/);
-            if (words.length > 1) {
-              value = words.pop();
-              target = words.join(' ');
-            }
-          }
-        }
-        target = target.replace(/^[«""']|[»""']$/g, '');
-      }
-      return { action: cleanLine, type, target, value, expected: null };
+  if (value === null) {
+    const words = work.split(/\s+/);
+    if (words.length >= 2) {
+      const v2 = words.pop();
+      value = stripQuotes(v2);
+      work  = words.join(' ');
     }
   }
-  // По умолчанию — клик
-  return { action: cleanLine, type: 'click', target: cleanLine, value: null, expected: null };
+  return { target: stripQuotes(work), value };
 }
 
-// Парсинг всего сценария
-function parseScenario(text) {
-  const lines = text.split('\n').filter(line => line.trim() !== '');
-  const steps = [];
-  let currentAction = null;
+function parseLine(line) {
+  const clean = line.replace(/^\s*(?:\d+\.)+\s*/, '').trim();
+  if (!clean) return null;
+  for (const { type, re } of ACTIONS) {
+    const m = clean.match(re);
+    if (!m) continue;
+    const rest = m[1].trim();
+    if (type === 'input' || type === 'select') {
+      const { target, value } = splitTargetValue(rest);
+      return { action: clean, type, target, value };
+    }
+    return { action: clean, type, target: stripQuotes(rest), value: null };
+  }
+  return { action: clean, type: 'click', target: clean, value: null };
+}
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    // Поддержка русских и английских маркеров ожидаемого результата
-    const resultMatch = line.match(/^(?:Результат|Result|Then|Ожидаемый результат|Expected result)\s*[:：-]\s*(.+)/i);
-    if (resultMatch) {
-      const expected = resultMatch[1].trim();
-      if (currentAction) {
-        currentAction.expected = expected;
-        steps.push(currentAction);
-        currentAction = null;
+function parseScenario(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const steps = [];
+  let pending = null;
+
+  const flush = () => { if (pending) { steps.push(pending); pending = null; } };
+
+  for (const line of lines) {
+    const em = line.match(EXPECT_RE);
+    if (em) {
+      const expected = em[1].trim();
+      if (pending) {
+        pending.expected = expected;
+        flush();
       } else {
-        // Только проверка без действия
-        steps.push({ action: 'Проверка: ' + expected, type: 'verify', target: null, value: null, expected });
+        steps.push({ action: 'Проверка', type: 'verify', target: null, value: null, expected });
       }
       continue;
     }
-    // Если предыдущее действие не закрыто результатом, сохраняем его
-    if (currentAction) {
-      steps.push(currentAction);
-      currentAction = null;
-    }
-    const parsed = parseActionLine(line);
-    if (parsed) {
-      currentAction = parsed;
-    }
+    flush();
+    const step = parseLine(line);
+    if (step) pending = step;
   }
-  if (currentAction) steps.push(currentAction);
+  flush();
   return steps;
 }
 
-async function sendMessageToTabSafely(tabId, message) {
-  try {
-    const response = await chrome.tabs.sendMessage(tabId, message);
-    if (chrome.runtime.lastError) throw new Error(chrome.runtime.lastError.message);
-    return response;
-  } catch (err) {
-    throw new Error(`Связь со страницей: ${err.message}`);
-  }
+// ---------- resolver ----------
+
+function normalize(s) {
+  return String(s ?? '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .replace(/[«»"""'']/g, '')
+    .trim();
 }
 
-async function runScenario(scenarioText) {
-  const statusDiv = document.getElementById('status');
-  const runBtn = document.getElementById('runBtn');
-  runBtn.disabled = true;
-  statusDiv.innerHTML = '';
+function tokenScore(a, b) {
+  const A = new Set(a.split(' ').filter(Boolean));
+  const B = new Set(b.split(' ').filter(Boolean));
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  const union = new Set([...A, ...B]).size;
+  return inter / union;
+}
 
-  const steps = parseScenario(scenarioText);
-  if (steps.length === 0) {
-    statusDiv.innerHTML = '<div class="step-card error"><span class="step-icon">❌</span><div class="step-content">Сценарий пуст</div></div>';
-    runBtn.disabled = false;
-    return;
+function scoreCandidate(target, el) {
+  const t = normalize(target);
+  if (!t) return 0;
+  const variants = [el.text, el.signature].filter(Boolean);
+  let best = 0;
+  for (const v of variants) {
+    if (v === t) { best = Math.max(best, 1); continue; }
+    if (v.includes(t)) { best = Math.max(best, 0.9); continue; }
+    if (t.includes(v) && v.length >= 3) { best = Math.max(best, 0.75); continue; }
+    best = Math.max(best, tokenScore(t, v) * 0.85);
   }
+  if (el.covered) best *= 0.7;
+  return best;
+}
 
+function resolveTarget(target, elements) {
+  return elements
+    .map(el => ({ el, score: scoreCandidate(target, el) }))
+    .sort((a, b) => b.score - a.score);
+}
+
+// ---------- transport ----------
+
+async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) {
-    statusDiv.innerHTML = '<div class="step-card error"><span class="step-icon">❌</span><div class="step-content">Нет активной вкладки</div></div>';
-    runBtn.disabled = false;
+  if (!tab?.id) throw new Error('Нет активной вкладки');
+  return tab;
+}
+
+function tabCall(tabId, method, params) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: 'TAB_CALL', tabId, method, params }, resp => {
+      if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+      if (!resp) return reject(new Error('Пустой ответ от background'));
+      if (!resp.ok) return reject(new Error(resp.error || 'Ошибка'));
+      resolve(resp);
+    });
+  });
+}
+
+// ---------- UI ----------
+
+function addCard(step) {
+  const card = document.createElement('div');
+  card.className = 'card running';
+
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.textContent = step.action;
+
+  const detail = document.createElement('div');
+  detail.className = 'detail';
+  if (step.expected) detail.textContent = `Ожидается: ${step.expected}`;
+
+  card.append(title, detail);
+  $status.appendChild(card);
+  card.scrollIntoView({ block: 'nearest' });
+  return { card, detail };
+}
+
+function setOk(card, detail, message) {
+  card.className = 'card ok';
+  if (message) detail.textContent = message;
+}
+
+function setErr(card, detail, message) {
+  card.className = 'card err';
+  detail.textContent = message;
+}
+
+function elLabel(el) {
+  const t = el.tag || '?';
+  const ty = el.type && el.type !== t ? `[type=${el.type}]` : '';
+  return `<${t}${ty}>`;
+}
+
+// ---------- runner ----------
+
+async function run() {
+  cancelled = false;
+  $run.disabled = true;
+  $cancel.disabled = false;
+  $status.innerHTML = '';
+
+  const steps = parseScenario($scenario.value);
+  if (!steps.length) {
+    $status.innerHTML = '<div class="card err"><div class="title">Сценарий пуст</div></div>';
+    resetButtons();
     return;
   }
+
+  let tab;
+  try { tab = await getActiveTab(); }
+  catch (e) { $status.innerHTML = `<div class="card err"><div class="title">${e.message}</div></div>`; resetButtons(); return; }
 
   try {
-    await initModel();
+    const snap = await tabCall(tab.id, 'SNAPSHOT');
+    if (!snap.url || snap.url.startsWith('chrome://') || snap.url.startsWith('edge://')) {
+      throw new Error('Нельзя работать на служебных страницах браузера');
+    }
   } catch (e) {
-    statusDiv.innerHTML = `<div class="step-card error"><span class="step-icon">❌</span><div class="step-content">Не удалось загрузить модель: ${e.message}</div></div>`;
-    runBtn.disabled = false;
-    return;
+    $status.innerHTML = `<div class="card err"><div class="title">${e.message}</div></div>`;
+    resetButtons(); return;
   }
 
-  for (let i = 0; i < steps.length; i++) {
-    const step = steps[i];
-    const card = document.createElement('div');
-    card.className = 'step-card processing';
-    card.innerHTML = `<span class="step-icon">⏳</span><div class="step-content"><div class="step-action">${step.action || 'Проверка: ' + step.expected}</div>${step.expected ? `<div class="expected-result">Ожидается: ${step.expected}</div>` : ''}</div>`;
-    statusDiv.appendChild(card);
-    card.scrollIntoView({ behavior: 'smooth' });
+  for (const step of steps) {
+    if (cancelled) break;
+    const { card, detail } = addCard(step);
 
     try {
-      // Шаг только с ожидаемым результатом (проверка без действия)
-      if (!step.type || step.type === 'verify' || !step.target) {
-        if (step.expected) {
-          await delay(1200);
-          const textRes = await sendMessageToTabSafely(tab.id, { type: 'GET_PAGE_TEXT' });
-          const pageText = textRes?.text || '';
-          if (!pageText) throw new Error('Не удалось получить текст страницы');
-          const fragments = pageText.split('\n').filter(f => f.trim().length > 2);
-          const expectedVec = await getEmbedding(step.expected);
-          let maxSim = -1, bestFrag = '';
-          for (const frag of fragments) {
-            const fragVec = await getEmbedding(frag);
-            const sim = cosineSimilarity(expectedVec, fragVec);
-            if (sim > maxSim) { maxSim = sim; bestFrag = frag; }
-          }
-          if (maxSim < 0.7) throw new Error(`Ожидаемый результат не подтверждён (лучшее: "${bestFrag}", сходство ${maxSim.toFixed(2)})`);
-          card.className = 'step-card success';
-          card.innerHTML = `<span class="step-icon">✅</span><div class="step-content"><div class="step-action">Проверка</div><div class="expected-result">✅ ${step.expected}</div></div>`;
-        }
+      if (step.type === 'verify' || !step.target) {
+        if (!step.expected) { setOk(card, detail, 'Пропущено'); continue; }
+        await verifyExpected(tab.id, step.expected);
+        setOk(card, detail, `✅ ${step.expected}`);
         continue;
       }
 
-      // Поиск элемента по цели
-      const targetVec = await getEmbedding(step.target);
-      const findRes = await sendMessageToTabSafely(tab.id, { type: 'FIND_ELEMENTS' });
-      if (!findRes?.elements?.length) throw new Error('Интерактивных элементов не найдено');
+      const desc = await tabCall(tab.id, 'DESCRIBE');
+      const candidates = desc.elements || [];
+      if (!candidates.length) throw new Error('На странице не найдено интерактивных элементов');
 
-      let bestIndex = -1, bestScore = -Infinity;
-      for (const item of findRes.elements) {
-        const vec = await getEmbedding(item.text);
-        const score = cosineSimilarity(targetVec, vec);
-        if (score > bestScore) { bestScore = score; bestIndex = item.id; }
+      const ranked = resolveTarget(step.target, candidates);
+      const top = ranked[0];
+      if (!top || top.score < 0.55) {
+        const near = ranked.slice(0, 3)
+          .map(r => `  • ${r.score.toFixed(2)} — ${elLabel(r.el)} ${r.el.signature.slice(0, 80)}`)
+          .join('\n');
+        throw new Error(`Цель не найдена (лучший score ${top ? top.score.toFixed(2) : '0'})\nКандидаты:\n${near}`);
+      }
+      if (ranked[1] && top.score - ranked[1].score < 0.05 && top.score < 0.9) {
+        const near = ranked.slice(0, 2)
+          .map(r => `  • ${r.score.toFixed(2)} — ${elLabel(r.el)} ${r.el.signature.slice(0, 80)}`)
+          .join('\n');
+        throw new Error(`Неоднозначная цель, уточните формулировку:\n${near}`);
       }
 
-      if (bestScore < 0.45) throw new Error(`Сходство ниже порога (${bestScore.toFixed(2)}). Элемент не найден`);
+      // подсветить найденный элемент, чтобы пользователь видел, во что попал матч
+      try { await tabCall(tab.id, 'HIGHLIGHT', { id: top.el.id, color: '#b388ff' }); } catch {}
 
-      // Выполнение действия
-      if (step.type === 'click') {
-        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_CLICK', index: bestIndex });
-      } else if (step.type === 'input') {
-        const valueToSend = step.value || '';
-        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_INPUT', index: bestIndex, value: valueToSend });
-      } else if (step.type === 'select') {
-        await sendMessageToTabSafely(tab.id, { type: 'EXECUTE_SELECT', index: bestIndex, value: step.value || '' });
-      }
-      await delay(800);
+      detail.textContent = `Цель: ${elLabel(top.el)} ${top.el.signature.slice(0, 100)} (${top.score.toFixed(2)})`;
 
-      // Проверка результата
-      if (step.expected) {
-        await delay(1200);
-        const textRes = await sendMessageToTabSafely(tab.id, { type: 'GET_PAGE_TEXT' });
-        const pageText = textRes?.text || '';
-        if (!pageText) throw new Error('Не удалось получить текст страницы');
+      const res = await tabCall(tab.id, 'PERFORM', {
+        id: top.el.id,
+        action: step.type,
+        payload: step.value
+      });
 
-        const fragments = pageText.split('\n').filter(f => f.trim().length > 2);
-        const expectedVec = await getEmbedding(step.expected);
-        let maxSim = -1, bestFrag = '';
-        for (const frag of fragments) {
-          const fragVec = await getEmbedding(frag);
-          const sim = cosineSimilarity(expectedVec, fragVec);
-          if (sim > maxSim) { maxSim = sim; bestFrag = frag; }
-        }
-        if (maxSim < 0.7) throw new Error(`Результат не подтверждён (лучшее: "${bestFrag}", сходство ${maxSim.toFixed(2)})`);
-        card.className = 'step-card success';
-        card.innerHTML = `<span class="step-icon">✅</span><div class="step-content"><div class="step-action">${step.action}</div><div class="expected-result">✅ ${step.expected}</div></div>`;
+      if (step.type === 'input') {
+        detail.textContent = `Записано в ${elLabel(top.el)}: "${res.result?.actual ?? ''}"`;
+      } else if (step.type === 'select' && res.result?.actual != null) {
+        detail.textContent = `Выбрано в ${elLabel(top.el)}: "${res.result.actual}"`;
       } else {
-        card.className = 'step-card success';
-        card.innerHTML = `<span class="step-icon">✅</span><div class="step-content"><div class="step-action">${step.action}</div></div>`;
+        detail.textContent = `Клик в ${elLabel(top.el)}`;
       }
-    } catch (err) {
-      card.className = 'step-card error';
-      card.innerHTML = `<span class="step-icon">❌</span><div class="step-content"><div class="step-action">${step.action || 'Проверка'}</div><div>${err.message}</div></div>`;
+
+      await tabCall(tab.id, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 });
+
+      if (step.expected) {
+        await verifyExpected(tab.id, step.expected);
+        setOk(card, detail, detail.textContent + `\n✅ ${step.expected}`);
+      } else {
+        setOk(card, detail, detail.textContent);
+      }
+    } catch (e) {
+      setErr(card, detail, e.message);
       break;
     }
   }
 
-  runBtn.disabled = false;
+  resetButtons();
 }
 
-document.getElementById('runBtn').addEventListener('click', () => {
-  runScenario(document.getElementById('scenario').value);
-});
+async function verifyExpected(tabId, expected) {
+  const snap = await tabCall(tabId, 'SNAPSHOT');
+  const hay = normalize(snap.text);
+  const needle = normalize(expected);
+  if (!needle) return;
+  if (hay.includes(needle)) return;
+
+  const tokens = needle.split(' ').filter(t => t.length > 2);
+  if (tokens.length) {
+    const hits = tokens.filter(t => hay.includes(t)).length;
+    if (hits / tokens.length >= 0.7) return;
+  }
+  throw new Error(`Ожидаемый текст не найден: "${expected}"`);
+}
+
+function resetButtons() {
+  $run.disabled = false;
+  $cancel.disabled = true;
+}
+
+// ---------- wire up ----------
+
+$run.addEventListener('click', run);
+$cancel.addEventListener('click', () => { cancelled = true; });
