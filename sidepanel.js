@@ -465,18 +465,43 @@ function humanUrl(url) {
 
 // ---------- stability helper ----------
 
-// Ждём стабилизации новой страницы после навигации. Пытаемся несколько раз,
-// потому что content script мог ещё не загрузиться на новой вкладке.
 async function waitForStableAfterNavigation(tabId, { attempts = 6, delayMs = 400 } = {}) {
   for (let i = 0; i < attempts; i++) {
     await delay(delayMs);
     try {
       await tabCall(tabId, 'WAIT_STABLE', { quietMs: 300, timeoutMs: 4000 });
       return;
-    } catch {
-      // content script ещё не готов — попробуем ещё раз
-    }
+    } catch {}
   }
+}
+
+// ---------- new-tab detection ----------
+
+// Снимок идентификаторов вкладок в текущем окне.
+async function snapshotTabIds() {
+  try {
+    const res = await tabsCall('LIST', { currentTabId });
+    const tabs = res.tabs || [];
+    return { ids: new Set(tabs.map(t => t.id)), tabs };
+  } catch {
+    return { ids: new Set(), tabs: [] };
+  }
+}
+
+// Пытается несколько раз найти вкладку, которой не было в prevIds.
+// Окно ожидания ~1.5 сек (200 + 300 + 400 + 600).
+async function detectNewTab(prevIds) {
+  const schedule = [200, 300, 400, 600];
+  for (const wait of schedule) {
+    await delay(wait);
+    try {
+      const res = await tabsCall('LIST', { currentTabId });
+      const tabs = res.tabs || [];
+      const found = tabs.find(t => !prevIds.has(t.id));
+      if (found) return found;
+    } catch {}
+  }
+  return null;
 }
 
 // ---------- runner ----------
@@ -768,6 +793,13 @@ async function run() {
       const top = await resolveAndHighlight(currentTabId, step.target);
       detail.textContent = `Цель: ${elLabel(top.el)} ${top.el.signature.slice(0, 100)} (${top.score.toFixed(2)})`;
 
+      // Перед клик'ом — снимаем снимок вкладок, чтобы после понять, не открылась ли новая.
+      const isClickLike = step.type === 'click' || step.type === 'rightClick';
+      let tabSnapshot = null;
+      if (isClickLike) {
+        tabSnapshot = await snapshotTabIds();
+      }
+
       const actionMap = { rightClick: 'rightClick' };
       const action = actionMap[step.type] || step.type;
 
@@ -775,9 +807,12 @@ async function run() {
         id: top.el.id, action, payload: step.value
       }, { allowNavigated: true });
 
+      let navigatedInPlace = false;
+
       if (res.navigated || res.result?.navigated) {
         detail.textContent = `Выполнено в ${elLabel(top.el)} → страница уходит в навигацию`;
         await waitForStableAfterNavigation(currentTabId, { attempts: 8, delayMs: 500 });
+        navigatedInPlace = true;
       } else {
         if (step.type === 'input') {
           detail.textContent = `Записано в ${elLabel(top.el)}: "${String(res.result?.actual ?? '').slice(0, 100)}"`;
@@ -789,6 +824,23 @@ async function run() {
         } else {
           detail.textContent = `Клик в ${elLabel(top.el)}`;
         }
+      }
+
+      // Если был клик — проверяем, не открылась ли новая вкладка.
+      // Тогда переключаемся туда и продолжаем прогон в ней.
+      let switchedToNewTab = false;
+      if (isClickLike && tabSnapshot) {
+        const newTab = await detectNewTab(tabSnapshot.ids);
+        if (newTab) {
+          currentTabId = newTab.id;
+          switchedToNewTab = true;
+          const titleStr = newTab.title || humanUrl(newTab.url) || '(без названия)';
+          detail.textContent += `\n↪ Открылась новая вкладка: "${titleStr}" (id ${newTab.id}). Переключаемся.`;
+          await waitForStableAfterNavigation(currentTabId, { attempts: 10, delayMs: 500 });
+        }
+      }
+
+      if (!navigatedInPlace && !switchedToNewTab) {
         await tabCall(currentTabId, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 }).catch(() => {});
       }
 
