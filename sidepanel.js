@@ -8,6 +8,7 @@ const $cancel = document.getElementById('cancelBtn');
 const $status = document.getElementById('status');
 
 let cancelled = false;
+let currentTabId = null;
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
@@ -200,12 +201,21 @@ function parseVerify(rest, action) {
 
 // ---------- line parser ----------
 
-const WAIT_RE   = /^(?:подожди|подождать|ждать|пауза|сделай\s+паузу|wait|sleep|pause)\s+(\d+(?:[.,]\d+)?)\s*(?:секунд[аыу]?|сек|s|second[s]?)?\s*$/i;
+const WAIT_RE   = /^(?:подожди|подождать|жди|обожди|ожидай|ожидание|ждать|пауза|сделай\s+паузу|wait|sleep|pause)\s+(\d+(?:[.,]\d+)?)\s*(?:секунд[аыу]?|сек|s|second[s]?)?\s*$/i;
 const PRESS_RE  = /^(?:нажми(?:\s+клавишу)?|нажать(?:\s+клавишу)?|жми|press|hit)\s+(.+)$/i;
 const SCROLL_RE = /^(?:прокрути|проскролль|скролл(?:ь)?|промотай|scroll)\s*(.*)$/i;
 const VERIFY_TRIGGER_RE = /^(?:проверь|проверить|убедись|убедиться|verify|check|assert|expect)(?:\s*,?\s*что)?\s+(.+)$/i;
 
-// Правый клик — идёт раньше обычного клика, чтобы «клик правой» не съедался «клик…».
+const TAB_LIST_RE    = /^(?:список\s+вкладок|покажи\s+вкладки|list\s+tabs|show\s+tabs)$/i;
+const TAB_SWITCH_RE  = /^(?:переключись(?:\s+на)?|активируй|switch\s+to|activate|go\s+to)\s+(?:вкладку|таб|tab)\s+(.+)$/i;
+const TAB_OPEN_RE    = /^(?:открой|открыть|создай|создать|open|create)\s+(?:новую\s+|new\s+)?вкладку(?:\s+с\s+url|\s+по\s+адресу|\s+url|\s+with\s+url)?\s*(.*)$/i;
+const TAB_CLOSE_RE   = /^(?:закрой|закрыть|close)\s+(?:текущую\s+|current\s+)?вкладку\s*(.*)$/i;
+const TAB_RELOAD_RE  = /^(?:обнови|обновить|перезагрузи|перезагрузить|reload|refresh)\s+(?:страницу|вкладку|page|tab)?\s*$/i;
+const TAB_BACK_RE    = /^(?:вернись\s+назад|назад|go\s+back|back)$/i;
+const TAB_FORWARD_RE = /^(?:вернись\s+вперёд|перейди\s+вперёд|вперёд|go\s+forward|forward)$/i;
+const TAB_NEXT_RE    = /^(?:следующая\s+вкладка|переключись\s+на\s+следующую\s+вкладку|next\s+tab|switch\s+to\s+next\s+tab)$/i;
+const TAB_PREV_RE    = /^(?:предыдущая\s+вкладка|переключись\s+на\s+предыдущую\s+вкладку|previous\s+tab|prev\s+tab|switch\s+to\s+previous\s+tab)$/i;
+
 const RIGHT_CLICK_RE = /^(?:правый\s+клик|клик\s+правой(?:\s+кнопкой)?|клик\s+пкм|пкм|контекстное\s+меню|открой\s+контекстное\s+меню|right\s+click|context\s+menu|rclick)\s+(.+)$/i;
 
 const ACTIONS = [
@@ -240,7 +250,51 @@ function parseLine(line) {
   const sm = clean.match(SCROLL_RE);
   if (sm) return parseScrollTail(sm[1], clean);
 
-  // Правый клик — проверяем до обычного клика
+  {
+    const m = clean.match(TAB_LIST_RE);
+    if (m) return { action: clean, type: 'tabList', target: null, value: null };
+  }
+  {
+    const m = clean.match(TAB_SWITCH_RE);
+    if (m) return { action: clean, type: 'tabSwitch', needle: extractTarget(m[1]), value: null };
+  }
+  {
+    const m = clean.match(TAB_OPEN_RE);
+    if (m) {
+      const tail = (m[1] || '').trim();
+      const url = tail ? stripQuotes(extractQuotedFrom(tail) || tail) : '';
+      return { action: clean, type: 'tabOpen', url, value: null };
+    }
+  }
+  {
+    const m = clean.match(TAB_CLOSE_RE);
+    if (m) {
+      const tail = (m[1] || '').trim();
+      const needle = tail ? extractTarget(tail) : null;
+      return { action: clean, type: 'tabClose', needle, value: null };
+    }
+  }
+  {
+    const m = clean.match(TAB_RELOAD_RE);
+    if (m) return { action: clean, type: 'tabReload', target: null, value: null };
+  }
+  {
+    const m = clean.match(TAB_BACK_RE);
+    if (m) return { action: clean, type: 'tabBack', target: null, value: null };
+  }
+  {
+    const m = clean.match(TAB_FORWARD_RE);
+    if (m) return { action: clean, type: 'tabForward', target: null, value: null };
+  }
+  {
+    const m = clean.match(TAB_NEXT_RE);
+    if (m) return { action: clean, type: 'tabNext', target: null, value: null };
+  }
+  {
+    const m = clean.match(TAB_PREV_RE);
+    if (m) return { action: clean, type: 'tabPrev', target: null, value: null };
+  }
+
   const rm = clean.match(RIGHT_CLICK_RE);
   if (rm) {
     return { action: clean, type: 'rightClick', target: extractTarget(rm[1]), value: null };
@@ -339,9 +393,23 @@ async function getActiveTab() {
   return tab;
 }
 
-function tabCall(tabId, method, params) {
+function tabCall(tabId, method, params, opts = {}) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage({ type: 'TAB_CALL', tabId, method, params }, resp => {
+    chrome.runtime.sendMessage(
+      { type: 'TAB_CALL', tabId, method, params, allowNavigated: !!opts.allowNavigated },
+      resp => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (!resp) return reject(new Error('Пустой ответ от background'));
+        if (!resp.ok) return reject(new Error(resp.error || 'Ошибка'));
+        resolve(resp);
+      }
+    );
+  });
+}
+
+function tabsCall(method, params) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: 'TABS_CALL', method, params }, resp => {
       if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
       if (!resp) return reject(new Error('Пустой ответ от background'));
       if (!resp.ok) return reject(new Error(resp.error || 'Ошибка'));
@@ -384,6 +452,31 @@ function elLabel(el) {
   const t = el.tag || '?';
   const ty = el.type && el.type !== t ? `[type=${el.type}]` : '';
   return `<${t}${ty}>`;
+}
+
+function humanUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname + (u.pathname !== '/' ? u.pathname : '');
+  } catch {
+    return url || '';
+  }
+}
+
+// ---------- stability helper ----------
+
+// Ждём стабилизации новой страницы после навигации. Пытаемся несколько раз,
+// потому что content script мог ещё не загрузиться на новой вкладке.
+async function waitForStableAfterNavigation(tabId, { attempts = 6, delayMs = 400 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    await delay(delayMs);
+    try {
+      await tabCall(tabId, 'WAIT_STABLE', { quietMs: 300, timeoutMs: 4000 });
+      return;
+    } catch {
+      // content script ещё не готов — попробуем ещё раз
+    }
+  }
 }
 
 // ---------- runner ----------
@@ -495,8 +588,88 @@ async function resolveAndHighlight(tabId, target) {
   return top;
 }
 
+async function handleTabStep(step, card, detail) {
+  switch (step.type) {
+    case 'tabList': {
+      const res = await tabsCall('LIST', { currentTabId });
+      const tabs = res.tabs || [];
+      const lines = tabs.map(t => {
+        const mark = t.active ? '▶' : '·';
+        const title = t.title || humanUrl(t.url) || '(без названия)';
+        const host = humanUrl(t.url);
+        return `  ${mark} ${title}${host ? ` — ${host}` : ''}`;
+      }).join('\n');
+      setOk(card, detail, `Открыто вкладок: ${tabs.length}\n${lines}`);
+      return currentTabId;
+    }
+
+    case 'tabSwitch': {
+      if (!step.needle) throw new Error('Не указано, на какую вкладку переключиться');
+      const res = await tabsCall('SWITCH', { currentTabId, needle: step.needle });
+      const t = res.tab;
+      setOk(card, detail, `Переключено на "${t.title || humanUrl(t.url)}" (id ${t.id})`);
+      return t.id;
+    }
+
+    case 'tabOpen': {
+      const res = await tabsCall('OPEN', { currentTabId, url: step.url });
+      const t = res.tab;
+      setOk(card, detail, `Открыта вкладка "${t.title || humanUrl(t.url)}" (id ${t.id})`);
+      return t.id;
+    }
+
+    case 'tabClose': {
+      const res = await tabsCall('CLOSE', { currentTabId, needle: step.needle });
+      const closed = res.result.closed;
+      const active = res.result.active;
+      const msg = `Закрыта вкладка "${closed.title || humanUrl(closed.url)}"` +
+        (active ? `\nАктивна: "${active.title || humanUrl(active.url)}" (id ${active.id})` : '');
+      setOk(card, detail, msg);
+      if (closed.id === currentTabId && active) return active.id;
+      return currentTabId;
+    }
+
+    case 'tabReload': {
+      await tabsCall('RELOAD', { currentTabId });
+      await waitForStableAfterNavigation(currentTabId, { attempts: 8, delayMs: 500 });
+      setOk(card, detail, 'Страница перезагружена');
+      return currentTabId;
+    }
+
+    case 'tabBack': {
+      await tabsCall('GO_BACK', { currentTabId });
+      await waitForStableAfterNavigation(currentTabId, { attempts: 6, delayMs: 400 });
+      setOk(card, detail, 'Вернулись назад');
+      return currentTabId;
+    }
+
+    case 'tabForward': {
+      await tabsCall('GO_FORWARD', { currentTabId });
+      await waitForStableAfterNavigation(currentTabId, { attempts: 6, delayMs: 400 });
+      setOk(card, detail, 'Перешли вперёд');
+      return currentTabId;
+    }
+
+    case 'tabNext':
+    case 'tabPrev': {
+      const dir = step.type === 'tabNext' ? 1 : -1;
+      const res = await tabsCall('CYCLE', { currentTabId, dir });
+      const t = res.tab;
+      setOk(card, detail, `Переключено на "${t.title || humanUrl(t.url)}" (id ${t.id})`);
+      return t.id;
+    }
+  }
+  return currentTabId;
+}
+
+const TAB_STEP_TYPES = new Set([
+  'tabList', 'tabSwitch', 'tabOpen', 'tabClose',
+  'tabReload', 'tabBack', 'tabForward', 'tabNext', 'tabPrev'
+]);
+
 async function run() {
   cancelled = false;
+  currentTabId = null;
   $run.disabled = true;
   $cancel.disabled = false;
   $status.innerHTML = '';
@@ -512,8 +685,10 @@ async function run() {
   try { tab = await getActiveTab(); }
   catch (e) { $status.innerHTML = `<div class="card err"><div class="title">${e.message}</div></div>`; resetButtons(); return; }
 
+  currentTabId = tab.id;
+
   try {
-    const snap = await tabCall(tab.id, 'SNAPSHOT');
+    const snap = await tabCall(currentTabId, 'SNAPSHOT');
     if (!snap.url || snap.url.startsWith('chrome://') || snap.url.startsWith('edge://')) {
       throw new Error('Нельзя работать на служебных страницах браузера');
     }
@@ -527,37 +702,44 @@ async function run() {
     const { card, detail } = addCard(step);
 
     try {
-      // --- WAIT ---
+      if (TAB_STEP_TYPES.has(step.type)) {
+        currentTabId = await handleTabStep(step, card, detail);
+        continue;
+      }
+
       if (step.type === 'wait') {
         await performWait(step.value, card, detail);
         setOk(card, detail, detail.textContent);
         continue;
       }
 
-      // --- PRESS ---
       if (step.type === 'press') {
-        const res = await tabCall(tab.id, 'PERFORM', {
+        const res = await tabCall(currentTabId, 'PERFORM', {
           id: null, action: 'press', payload: step.key
-        });
+        }, { allowNavigated: true });
         const info = res.result || {};
-        detail.textContent = `Нажато ${info.actual || step.key}` +
-          (info.pressedOn ? ` в ${info.pressedOn}` : '') +
-          (info.defaultPrevented ? ' (обработано страницей)' : '');
-        await tabCall(tab.id, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 });
+        if (info.navigated) {
+          detail.textContent = `Нажато ${step.key} → страница уходит в навигацию`;
+          await waitForStableAfterNavigation(currentTabId, { attempts: 8, delayMs: 500 });
+        } else {
+          detail.textContent = `Нажато ${info.actual || step.key}` +
+            (info.pressedOn ? ` в ${info.pressedOn}` : '') +
+            (info.defaultPrevented ? ' (обработано страницей)' : '');
+          await tabCall(currentTabId, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 }).catch(() => {});
+        }
         if (step.expected) {
-          await runVerify(tab.id, { type: 'verify', verifyKind: 'textOnPage', expected: step.expected });
+          await runVerify(currentTabId, { type: 'verify', verifyKind: 'textOnPage', expected: step.expected });
           detail.textContent += `\n✅ ${step.expected}`;
         }
         setOk(card, detail, detail.textContent);
         continue;
       }
 
-      // --- SCROLL ---
       if (step.type === 'scroll') {
         let params;
         let human;
         if (step.scrollTo) {
-          const desc = await tabCall(tab.id, 'DESCRIBE');
+          const desc = await tabCall(currentTabId, 'DESCRIBE');
           const ranked = resolveTarget(step.scrollTo, desc.elements || []);
           const top = ranked[0];
           if (!top || top.score < 0.55) {
@@ -570,46 +752,48 @@ async function run() {
           const dir = { up: 'вверх', down: 'вниз', top: 'в начало', bottom: 'в конец' }[step.direction] || step.direction;
           human = `${dir}${step.amount ? ` на ${step.amount}px` : ''}`;
         }
-        await tabCall(tab.id, 'SCROLL', params);
+        await tabCall(currentTabId, 'SCROLL', params, { allowNavigated: true });
         await delay(500);
         setOk(card, detail, `Прокручено ${human}`);
         continue;
       }
 
-      // --- VERIFY ---
       if (step.type === 'verify') {
-        await runVerify(tab.id, step);
+        await runVerify(currentTabId, step);
         const label = step.expected ? `✅ ${step.expected}` : '✅ Проверка пройдена';
         setOk(card, detail, label);
         continue;
       }
 
-      // --- CLICK / RIGHTCLICK / INPUT / SELECT ---
-      const top = await resolveAndHighlight(tab.id, step.target);
+      const top = await resolveAndHighlight(currentTabId, step.target);
       detail.textContent = `Цель: ${elLabel(top.el)} ${top.el.signature.slice(0, 100)} (${top.score.toFixed(2)})`;
 
       const actionMap = { rightClick: 'rightClick' };
       const action = actionMap[step.type] || step.type;
 
-      const res = await tabCall(tab.id, 'PERFORM', {
+      const res = await tabCall(currentTabId, 'PERFORM', {
         id: top.el.id, action, payload: step.value
-      });
+      }, { allowNavigated: true });
 
-      if (step.type === 'input') {
-        detail.textContent = `Записано в ${elLabel(top.el)}: "${String(res.result?.actual ?? '').slice(0, 100)}"`;
-      } else if (step.type === 'select' && res.result?.actual != null) {
-        detail.textContent = `Выбрано в ${elLabel(top.el)}: "${res.result.actual}"`;
-      } else if (step.type === 'rightClick') {
-        const handled = res.result?.defaultPrevented ? 'контекстное меню перехвачено страницей' : 'отправлено';
-        detail.textContent = `Правый клик в ${elLabel(top.el)} (${handled})`;
+      if (res.navigated || res.result?.navigated) {
+        detail.textContent = `Выполнено в ${elLabel(top.el)} → страница уходит в навигацию`;
+        await waitForStableAfterNavigation(currentTabId, { attempts: 8, delayMs: 500 });
       } else {
-        detail.textContent = `Клик в ${elLabel(top.el)}`;
+        if (step.type === 'input') {
+          detail.textContent = `Записано в ${elLabel(top.el)}: "${String(res.result?.actual ?? '').slice(0, 100)}"`;
+        } else if (step.type === 'select' && res.result?.actual != null) {
+          detail.textContent = `Выбрано в ${elLabel(top.el)}: "${res.result.actual}"`;
+        } else if (step.type === 'rightClick') {
+          const handled = res.result?.defaultPrevented ? 'контекстное меню перехвачено страницей' : 'отправлено';
+          detail.textContent = `Правый клик в ${elLabel(top.el)} (${handled})`;
+        } else {
+          detail.textContent = `Клик в ${elLabel(top.el)}`;
+        }
+        await tabCall(currentTabId, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 }).catch(() => {});
       }
 
-      await tabCall(tab.id, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 });
-
       if (step.expected) {
-        await runVerify(tab.id, { type: 'verify', verifyKind: 'textOnPage', expected: step.expected });
+        await runVerify(currentTabId, { type: 'verify', verifyKind: 'textOnPage', expected: step.expected });
         setOk(card, detail, detail.textContent + `\n✅ ${step.expected}`);
       } else {
         setOk(card, detail, detail.textContent);

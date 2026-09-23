@@ -1,14 +1,25 @@
 {
   "manifest_version": 3,
   "name": "AI QA Assistant",
-  "version": "0.1",
-  "description": "Семантический запуск тестовых сценариев (v0.1: детерминированное ядро)",
+  "version": "0.2",
+  "description": "Семантический запуск тестовых сценариев (RU/EN) с управлением вкладками",
   "minimum_chrome_version": "114",
-  "permissions": ["sidePanel", "scripting"],
+  "permissions": [
+    "sidePanel",
+    "scripting",
+    "tabs"
+  ],
   "host_permissions": ["<all_urls>"],
-  "side_panel": { "default_path": "sidepanel.html" },
-  "action": { "default_title": "AI QA панель" },
-  "background": { "service_worker": "background.js", "type": "module" },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_title": "AI QA панель"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
