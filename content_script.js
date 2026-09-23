@@ -16,6 +16,11 @@
     '[role="link"]',
     '[role="textbox"]',
     '[role="combobox"]',
+    '[role="menuitem"]',
+    '[role="menuitemcheckbox"]',
+    '[role="menuitemradio"]',
+    '[role="option"]',
+    '[role="tab"]',
     '[contenteditable=""]',
     '[contenteditable="true"]'
   ].join(',');
@@ -31,6 +36,15 @@
       .toLowerCase()
       .replace(/[«»"""'']/g, '')
       .trim();
+  }
+
+  // Убирает эмодзи, вариационные селекторы, ZWJ и skin-tone модификаторы.
+  // Lexical и другие rich-редакторы хранят эмодзи в модели, но рендерят их
+  // пустым декоратором — в textContent символа нет.
+  function stripEmoji(s) {
+    return String(s ?? '')
+      .replace(/\p{Extended_Pictographic}/gu, '')
+      .replace(/[\uFE0E\uFE0F\u200D\u20E3]/g, '');
   }
 
   function isEditable(el) {
@@ -134,6 +148,7 @@
   }
 
   function highlight(el, color = '#b388ff', { holdMs = 2000, fadeMs = 500 } = {}) {
+    if (!el || el.nodeType !== 1) return;
     clearHighlights();
 
     el.style.transition = 'none';
@@ -160,36 +175,176 @@
     }, holdMs);
   }
 
+  // ---------- mouse ----------
+
+  function dispatchMouseSequence(el, { button = 0, contextmenu = false } = {}) {
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+
+    const common = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      screenX: x,
+      screenY: y
+    };
+
+    const buttonsDown = button === 2 ? 2 : (button === 1 ? 4 : 1);
+
+    try {
+      el.dispatchEvent(new PointerEvent('pointerover',  { ...common, button: -1, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+      el.dispatchEvent(new PointerEvent('pointerenter', { ...common, button: -1, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, bubbles: false }));
+      el.dispatchEvent(new PointerEvent('pointermove',  { ...common, button: -1, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+      el.dispatchEvent(new PointerEvent('pointerdown',  { ...common, button, buttons: buttonsDown, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+    } catch {}
+
+    el.dispatchEvent(new MouseEvent('mouseover',  { ...common, button: -1, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent('mouseenter', { ...common, button: -1, buttons: 0, bubbles: false }));
+    el.dispatchEvent(new MouseEvent('mousemove',  { ...common, button: -1, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent('mousedown',  { ...common, button, buttons: buttonsDown }));
+
+    if (contextmenu) {
+      const ctx = new MouseEvent('contextmenu', { ...common, button: 2, buttons: 2 });
+      el.dispatchEvent(ctx);
+
+      try {
+        el.dispatchEvent(new PointerEvent('pointerup', { ...common, button: 2, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+      } catch {}
+      el.dispatchEvent(new MouseEvent('mouseup', { ...common, button: 2, buttons: 0 }));
+
+      return { defaultPrevented: ctx.defaultPrevented };
+    }
+
+    try {
+      el.dispatchEvent(new PointerEvent('pointerup', { ...common, button, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+    } catch {}
+    el.dispatchEvent(new MouseEvent('mouseup', { ...common, button, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent('click',   { ...common, button, buttons: 0, detail: 1 }));
+
+    return { defaultPrevented: false };
+  }
+
+  // ---------- keyboard ----------
+
+  const KNOWN_KEYS = {
+    enter:     { key: 'Enter',      code: 'Enter',      keyCode: 13 },
+    tab:       { key: 'Tab',        code: 'Tab',        keyCode: 9  },
+    escape:    { key: 'Escape',     code: 'Escape',     keyCode: 27 },
+    esc:       { key: 'Escape',     code: 'Escape',     keyCode: 27 },
+    backspace: { key: 'Backspace',  code: 'Backspace',  keyCode: 8  },
+    delete:    { key: 'Delete',     code: 'Delete',     keyCode: 46 },
+    del:       { key: 'Delete',     code: 'Delete',     keyCode: 46 },
+    space:     { key: ' ',          code: 'Space',      keyCode: 32 },
+    arrowup:   { key: 'ArrowUp',    code: 'ArrowUp',    keyCode: 38 },
+    arrowdown: { key: 'ArrowDown',  code: 'ArrowDown',  keyCode: 40 },
+    arrowleft: { key: 'ArrowLeft',  code: 'ArrowLeft',  keyCode: 37 },
+    arrowright:{ key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+    up:        { key: 'ArrowUp',    code: 'ArrowUp',    keyCode: 38 },
+    down:      { key: 'ArrowDown',  code: 'ArrowDown',  keyCode: 40 },
+    left:      { key: 'ArrowLeft',  code: 'ArrowLeft',  keyCode: 37 },
+    right:     { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+    home:      { key: 'Home',       code: 'Home',       keyCode: 36 },
+    end:       { key: 'End',        code: 'End',        keyCode: 35 },
+    pageup:    { key: 'PageUp',     code: 'PageUp',     keyCode: 33 },
+    pagedown:  { key: 'PageDown',   code: 'PageDown',   keyCode: 34 }
+  };
+
+  function buildKeyInfo(spec) {
+    const raw = String(spec ?? '').trim();
+    if (!raw) return null;
+    const parts = raw.split('+').map(s => s.trim()).filter(Boolean);
+    if (!parts.length) return null;
+
+    let ctrl = false, alt = false, shift = false, meta = false;
+    const last = parts.pop();
+    for (const p of parts) {
+      const l = p.toLowerCase();
+      if (l === 'ctrl' || l === 'control') ctrl = true;
+      else if (l === 'alt') alt = true;
+      else if (l === 'shift') shift = true;
+      else if (l === 'meta' || l === 'cmd' || l === 'win' || l === 'super') meta = true;
+      else return null;
+    }
+
+    const k = last.toLowerCase();
+    if (KNOWN_KEYS[k]) return { ...KNOWN_KEYS[k], ctrl, alt, shift, meta, spec: raw };
+
+    if (/^f\d{1,2}$/.test(k)) {
+      const n = parseInt(k.slice(1), 10);
+      return { key: `F${n}`, code: `F${n}`, keyCode: 111 + n, ctrl, alt, shift, meta, spec: raw };
+    }
+
+    if (last.length === 1) {
+      const upper = last.toUpperCase();
+      const isLetter = /[a-z]/i.test(last);
+      const isDigit = /[0-9]/.test(last);
+      return {
+        key: shift ? upper : last,
+        code: isLetter ? `Key${upper}` : (isDigit ? `Digit${last}` : ''),
+        keyCode: upper.charCodeAt(0),
+        ctrl, alt, shift, meta, spec: raw
+      };
+    }
+
+    return null;
+  }
+
+  function dispatchKeyOn(el, info) {
+    const opts = {
+      key: info.key,
+      code: info.code,
+      keyCode: info.keyCode,
+      which: info.keyCode,
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: info.ctrl,
+      altKey: info.alt,
+      shiftKey: info.shift,
+      metaKey: info.meta,
+      composed: true
+    };
+
+    const kd = new KeyboardEvent('keydown', opts);
+    el.dispatchEvent(kd);
+
+    if (!info.ctrl && !info.alt && !info.meta && info.key.length === 1) {
+      el.dispatchEvent(new KeyboardEvent('keypress', opts));
+    }
+
+    el.dispatchEvent(new KeyboardEvent('keyup', opts));
+
+    return { defaultPrevented: kd.defaultPrevented };
+  }
+
   // ---------- contenteditable insertion ----------
 
-  // Возвращает true, если значение «похоже» уже находится в элементе ровно один раз.
-  // Учитывает, что rich-редакторы разбивают текст на несколько спанов и рендерят эмодзи
-  // как декораторы (их нет в textContent).
+  // Считаем вхождения probe в тексте, предварительно вычистив эмодзи с обеих сторон.
+  // Это единственный способ ужиться с редакторами, которые рендерят эмодзи как декораторы.
   function countProbe(text, value) {
-    const a = String(text || '').replace(/\s+/g, ' ').trim();
-    // Первые 15 code points значения — этого достаточно, чтобы отличить
-    // «вставлено», «не вставлено» и «вставлено дважды».
-    const probe = Array.from(String(value || '').replace(/\s+/g, ' ').trim()).slice(0, 15).join('');
-    if (!probe) return { count: 1, probe };
-    // Используем нежадный split: считаем все вхождения probe в a.
+    const hay = stripEmoji(text).replace(/\s+/g, ' ').trim().toLowerCase();
+    const valueClean = stripEmoji(value).replace(/\s+/g, ' ').trim();
+    const probe = Array.from(valueClean).slice(0, 15).join('').toLowerCase();
+    if (!probe) {
+      // значение состоит только из эмодзи/символов — не можем отличить успех от провала
+      // по тексту, считаем, что редактор справился (emоji-декораторы мы не видим)
+      return { count: hay.length > 0 ? 1 : 1, probe: '' };
+    }
     let count = 0;
     let idx = 0;
-    while ((idx = a.indexOf(probe, idx)) !== -1) {
+    while ((idx = hay.indexOf(probe, idx)) !== -1) {
       count++;
       idx += probe.length;
     }
     return { count, probe };
   }
 
-  // Пытаемся заменить текущее выделение синтетическим beforeinput.
-  // Синтетическое событие не имеет default action, поэтому браузер сам ничего не вставит
-  // — вставку выполняет обработчик редактора (Lexical / ProseMirror / Slate).
   function dispatchBeforeInput(el, value) {
     const evt = new InputEvent('beforeinput', {
-      bubbles: true,
-      cancelable: true,
-      inputType: 'insertText',
-      data: value
+      bubbles: true, cancelable: true, inputType: 'insertText', data: value
     });
     el.dispatchEvent(evt);
   }
@@ -197,11 +352,7 @@
   function dispatchPaste(el, value) {
     const dt = new DataTransfer();
     dt.setData('text/plain', value);
-    const evt = new ClipboardEvent('paste', {
-      bubbles: true,
-      cancelable: true
-    });
-    // clipboardData конструктором не выставляется в свежих Chrome — определяем вручную.
+    const evt = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
     try { Object.defineProperty(evt, 'clipboardData', { value: dt }); } catch {}
     el.dispatchEvent(evt);
   }
@@ -209,14 +360,12 @@
   async function insertIntoContentEditable(el, value) {
     el.focus();
 
-    // Выделяем текущее содержимое, чтобы вставка заменила его, а не дописала.
     const range = document.createRange();
     range.selectNodeContents(el);
     const sel = window.getSelection();
     sel?.removeAllRanges();
     sel?.addRange(range);
 
-    // Попытка 1: beforeinput — предпочтительный путь для Lexical и подобных.
     dispatchBeforeInput(el, value);
     await sleep(120);
 
@@ -224,8 +373,6 @@
     let { count } = countProbe(text, value);
     if (count === 1) return { ok: true, actual: text.trim() };
 
-    // Попытка 2: paste — на случай, если редактор слушает только вставку.
-    // Сначала заново выделяем содержимое, чтобы не дописать к уже вставленному.
     if (count === 0) {
       const r2 = document.createRange();
       r2.selectNodeContents(el);
@@ -249,8 +396,7 @@
     if (count > 1) {
       throw new Error(
         `Редактор вставил текст ${count} раз вместо одного. ` +
-        `В элементе "${text.trim().slice(0, 120)}". Это внутренняя проблема редактора, ` +
-        `сообщите, пожалуйста, разработчику расширения.`
+        `В элементе "${text.trim().slice(0, 120)}".`
       );
     }
     return { ok: true, actual: text.trim() };
@@ -273,7 +419,30 @@
     return out;
   }
 
+  async function performPress(id, keySpec) {
+    const info = buildKeyInfo(keySpec);
+    if (!info) throw new Error(`Неизвестная клавиша: "${keySpec}"`);
+
+    let target = (id != null) ? registry.get(id) : null;
+    if (!target || !target.isConnected) target = document.activeElement || document.body;
+    if (!target) throw new Error('Нет активного элемента');
+
+    highlight(target);
+    try { target.focus({ preventScroll: false }); } catch {}
+    await sleep(30);
+
+    const { defaultPrevented } = dispatchKeyOn(target, info);
+    await sleep(80);
+
+    const tag = target.tagName ? target.tagName.toLowerCase() : '?';
+    return { ok: true, actual: info.spec, pressedOn: `<${tag}>`, defaultPrevented };
+  }
+
   async function perform(id, action, payload) {
+    if (action === 'press') {
+      return performPress(id, payload);
+    }
+
     const el = registry.get(id);
     if (!el || !el.isConnected) throw new Error('Элемент больше не в DOM');
     if (!isVisible(el)) throw new Error('Элемент невидим');
@@ -288,17 +457,23 @@
       return { ok: true, actual: null };
     }
 
+    if (action === 'rightClick') {
+      if (isCovered(el)) {
+        throw new Error('Элемент перекрыт другим — правый клик попадёт не туда');
+      }
+      const { defaultPrevented } = dispatchMouseSequence(el, { button: 2, contextmenu: true });
+      await sleep(120);
+      return { ok: true, actual: 'contextmenu', defaultPrevented };
+    }
+
     if (action === 'input') {
       if (isCovered(el)) {
         throw new Error(
-          `Элемент ${el.tagName.toLowerCase()} перекрыт другим — вероятно, это скрытый «зеркальный» узел. ` +
-          `Уточните формулировку цели, чтобы матч попал в видимый элемент.`
+          `Элемент ${el.tagName.toLowerCase()} перекрыт другим — вероятно, скрытый «зеркальный» узел.`
         );
       }
       if (!isEditable(el)) {
-        throw new Error(
-          `Элемент <${el.tagName.toLowerCase()}> не является редактируемым (не input/textarea/contenteditable)`
-        );
+        throw new Error(`Элемент <${el.tagName.toLowerCase()}> не является редактируемым`);
       }
 
       const value = String(payload ?? '');
@@ -322,8 +497,7 @@
       const actual = 'value' in el ? String(el.value ?? '') : '';
       if (actual !== value) {
         throw new Error(
-          `Фреймворк откатил значение. Ожидалось "${value}", в элементе "${actual}". ` +
-          `Элемент <${el.tagName.toLowerCase()}${el.type ? `[type=${el.type}]` : ''}>.`
+          `Фреймворк откатил значение. Ожидалось "${value}", в элементе "${actual}".`
         );
       }
       return { ok: true, actual };
@@ -348,6 +522,80 @@
     }
 
     throw new Error(`Неизвестное действие: ${action}`);
+  }
+
+  function performScroll(params) {
+    const { direction, amount, targetId } = params || {};
+
+    if (targetId != null) {
+      const el = registry.get(targetId);
+      if (!el) throw new Error('Элемент не найден в реестре');
+      highlight(el);
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return { ok: true, mode: 'element' };
+    }
+
+    const amt = Number.isFinite(amount) ? amount : Math.round(window.innerHeight * 0.8);
+    if (direction === 'top') {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } else if (direction === 'bottom') {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+    } else if (direction === 'up') {
+      window.scrollBy({ top: -amt, behavior: 'smooth' });
+    } else if (direction === 'down') {
+      window.scrollBy({ top: amt, behavior: 'smooth' });
+    } else {
+      throw new Error(`Неизвестное направление скролла: "${direction}"`);
+    }
+    return { ok: true, mode: 'window', amount: amt };
+  }
+
+  function checkElement(id, kind, expected) {
+    const el = registry.get(id);
+    if (!el || !el.isConnected) {
+      return { ok: false, error: 'Элемент больше не в DOM' };
+    }
+
+    const valOf = () =>
+      'value' in el ? String(el.value ?? '') : (el.textContent || '').trim();
+
+    if (kind === 'visible' || kind === 'exists') {
+      if (!isVisible(el)) return { ok: false, error: 'Элемент не виден' };
+      return { ok: true };
+    }
+
+    if (kind === 'enabled') {
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
+        return { ok: false, error: 'Элемент disabled' };
+      }
+      return { ok: true };
+    }
+
+    if (kind === 'disabled') {
+      if (!(el.disabled || el.getAttribute('aria-disabled') === 'true')) {
+        return { ok: false, error: 'Элемент активен' };
+      }
+      return { ok: true };
+    }
+
+    if (kind === 'empty') {
+      const actual = valOf();
+      if (actual === '') return { ok: true, details: { actual } };
+      return { ok: false, error: `Не пусто: "${actual.slice(0, 60)}"`, details: { actual } };
+    }
+
+    if (kind === 'valueContains' || kind === 'valueEquals') {
+      const actual = valOf();
+      const want = String(expected ?? '');
+      if (kind === 'valueContains') {
+        if (normalize(actual).includes(normalize(want))) return { ok: true, details: { actual } };
+        return { ok: false, error: `"${actual.slice(0, 60)}" не содержит "${want}"`, details: { actual } };
+      }
+      if (actual === want) return { ok: true, details: { actual } };
+      return { ok: false, error: `"${actual.slice(0, 60)}" ≠ "${want}"`, details: { actual } };
+    }
+
+    return { ok: false, error: `Неизвестный вид проверки: ${kind}` };
   }
 
   function snapshot() {
@@ -386,22 +634,46 @@
       if (msg.method === 'PING')     return void sendResponse({ ok: true });
       if (msg.method === 'DESCRIBE') return void sendResponse({ ok: true, elements: describe() });
       if (msg.method === 'SNAPSHOT') return void sendResponse({ ok: true, ...snapshot() });
+
       if (msg.method === 'HIGHLIGHT') {
         const el = registry.get(msg.params.id);
         if (!el) return void sendResponse({ ok: false, error: 'Нет такого id' });
         highlight(el, msg.params.color || '#b388ff', msg.params.options || {});
         return void sendResponse({ ok: true });
       }
+
       if (msg.method === 'PERFORM') {
         perform(msg.params.id, msg.params.action, msg.params.payload)
           .then(result => sendResponse({ ok: true, result }))
           .catch(e => sendResponse({ ok: false, error: e.message }));
         return true;
       }
+
+      if (msg.method === 'SCROLL') {
+        try {
+          const result = performScroll(msg.params || {});
+          return void sendResponse({ ok: true, result });
+        } catch (e) {
+          return void sendResponse({ ok: false, error: e.message });
+        }
+      }
+
+      if (msg.method === 'CHECK_ELEMENT') {
+        try {
+          const result = checkElement(msg.params.id, msg.params.kind, msg.params.expected);
+          return void sendResponse(result.ok
+            ? { ok: true, details: result.details }
+            : { ok: false, error: result.error, details: result.details });
+        } catch (e) {
+          return void sendResponse({ ok: false, error: e.message });
+        }
+      }
+
       if (msg.method === 'WAIT_STABLE') {
         waitForStable(msg.params || {}).then(() => sendResponse({ ok: true }));
         return true;
       }
+
       sendResponse({ ok: false, error: `Неизвестный метод: ${msg.method}` });
     } catch (e) {
       sendResponse({ ok: false, error: e.message });

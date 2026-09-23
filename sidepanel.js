@@ -1,6 +1,7 @@
 // sidepanel.js
 'use strict';
 
+// ---------- DOM ----------
 const $scenario = document.getElementById('scenario');
 const $run = document.getElementById('runBtn');
 const $cancel = document.getElementById('cancelBtn');
@@ -10,20 +11,15 @@ let cancelled = false;
 
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-const ACTIONS = [
-  { type: 'click',  re: /^(?:нажми|нажать|кликни|кликнуть|клик|тыкни|ткни|перейди|перейти|открой|открыть|click|tap|press|open|go to|visit)\s+(.+)/i },
-  { type: 'input',  re: /^(?:введи|ввести|напиши|написать|заполни|заполнить|вставь|вставить|input|type|fill|enter)\s+(.+)/i },
-  { type: 'select', re: /^(?:выбери|выбрать|отметь|отметить|select|choose|pick)\s+(.+)/i },
-  { type: 'verify', re: /^(?:проверь|проверить|убедись|убедиться|verify|check|assert|expect)\s+(.+)/i }
-];
-
-const WAIT_RE         = /^(?:подожди|подождать|ждать|пауза|сделай\s+паузу|wait|sleep|pause)\s+(\d+(?:[.,]\d+)?)\s*(?:секунд[аыу]?|сек|s|second[s]?)?\s*$/i;
-const EXPECT_RE       = /^(?:результат|ожидаемый результат|result|expected result|then)\s*[:：-]\s*(.+)/i;
-const VALUE_MARKER_RE = /\s+(?:значение|сообщение|текст|value|text)\s*[:=]?\s+(.+)$/i;
-const FIELD_PREFIX_RE = /^(?:в\s+поле|поле|field|into)\s+(.+)$/i;
+// ---------- parser helpers ----------
 
 function stripQuotes(s) {
   return String(s ?? '').replace(/^[\s"'«»"""'']+|[\s"'«»"""'']+$/g, '').trim();
+}
+
+function extractQuotedFrom(s) {
+  const m = String(s ?? '').match(/["'«»""]([^"'«»""]+)["'«»""]/);
+  return m ? m[1] : null;
 }
 
 function extractQuoted(s) {
@@ -47,14 +43,17 @@ function stripPrepositions(s) {
 }
 
 function extractTarget(rest) {
-  const quoted = extractQuoted(rest);
-  if (quoted.length >= 1) return stripQuotes(quoted[0]);
+  const q = extractQuotedFrom(rest);
+  if (q) return stripQuotes(q);
   return stripQuotes(stripPrepositions(rest));
 }
 
 function splitTargetValue(rest) {
   let work = rest.trim();
   let value = null;
+
+  const VALUE_MARKER_RE = /\s+(?:значение|сообщение|текст|value|text)\s*[:=]?\s+(.+)$/i;
+  const FIELD_PREFIX_RE = /^(?:в\s+поле|поле|field|into)\s+(.+)$/i;
 
   const vm = work.match(VALUE_MARKER_RE);
   if (vm) {
@@ -95,6 +94,128 @@ function splitTargetValue(rest) {
   return { target, value };
 }
 
+const KNOWN_KEY_NAMES = new Set([
+  'enter', 'tab', 'escape', 'esc', 'backspace', 'delete', 'del', 'space',
+  'arrowup', 'arrowdown', 'arrowleft', 'arrowright',
+  'up', 'down', 'left', 'right',
+  'home', 'end', 'pageup', 'pagedown'
+]);
+
+function looksLikeKey(spec) {
+  const raw = String(spec ?? '').trim().toLowerCase();
+  if (!raw) return false;
+  if (/^f\d{1,2}$/.test(raw)) return true;
+
+  const parts = raw.split('+').map(x => x.trim());
+  if (!parts.length) return false;
+
+  const MODS = ['ctrl', 'control', 'alt', 'shift', 'meta', 'cmd', 'win', 'super'];
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!MODS.includes(parts[i])) return false;
+  }
+
+  const last = parts[parts.length - 1];
+  if (last.length === 1) return true;
+  if (KNOWN_KEY_NAMES.has(last)) return true;
+  return false;
+}
+
+// ---------- scroll parser ----------
+
+function parseScrollTail(tail, action) {
+  const t = String(tail ?? '').trim().toLowerCase();
+
+  let m = t.match(/^(?:до|к)\s+["'«»""](.+?)["'«»""]\s*$/);
+  if (m) return { action, type: 'scroll', scrollTo: stripQuotes(m[1]) };
+  m = t.match(/^(?:до|к)\s+(.+)$/);
+  if (m) return { action, type: 'scroll', scrollTo: stripQuotes(m[1]) };
+
+  m = t.match(/^(вниз|вверх|down|up)\s+(?:на\s+)?(\d+)/i);
+  if (m) {
+    const dir = /вниз|down/i.test(m[1]) ? 'down' : 'up';
+    return { action, type: 'scroll', direction: dir, amount: parseInt(m[2], 10) };
+  }
+
+  m = t.match(/^на\s+(\d+)/);
+  if (m) return { action, type: 'scroll', direction: 'down', amount: parseInt(m[1], 10) };
+
+  if (/(?:самый\s+|самое\s+)?низ|bottom|до\s+конца|до\s+низа|конец\s+страницы/.test(t)) {
+    return { action, type: 'scroll', direction: 'bottom' };
+  }
+  if (/(?:самый\s+|самое\s+)?верх|top|до\s+начала|до\s+верха|начало\s+страницы/.test(t)) {
+    return { action, type: 'scroll', direction: 'top' };
+  }
+
+  if (/\bвниз\b|down|ниже/.test(t)) return { action, type: 'scroll', direction: 'down' };
+  if (/\bвверх\b|\bнаверх\b|\bвыше\b|\bup\b/.test(t)) return { action, type: 'scroll', direction: 'up' };
+
+  return { action, type: 'scroll', direction: 'down' };
+}
+
+// ---------- verify parser ----------
+
+function parseVerify(rest, action) {
+  const body = String(rest ?? '').trim();
+
+  let m = body.match(/^(?:url|адрес(?:\s+страницы)?)\s*(?:содержит|contains|:|=)\s*["'«»""]?(.+?)["'«»""]?\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'urlContains', expected: stripQuotes(m[1]) };
+  m = body.match(/^(?:url|адрес(?:\s+страницы)?)\s*(?:равен|равно|==|equals?)\s*["'«»""]?(.+?)["'«»""]?\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'urlEquals', expected: stripQuotes(m[1]) };
+
+  m = body.match(/^(?:заголовок|title)\s*(?:содержит|contains|:|=)\s*["'«»""]?(.+?)["'«»""]?\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'titleContains', expected: stripQuotes(m[1]) };
+
+  m = body.match(/^(.+?)\s+не\s+существует\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'notExists', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+существует\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'exists', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+(видим[оа]?|виден|видна|отображается|показан[оа]?|visible)\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'visible', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+(скрыт[оа]?|не\s+видим[оа]?|не\s+видно|hidden)\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'hidden', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+(неактив[ноаы]+|выключен[оа]?|disabled|заблокирован[оа]?)\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'disabled', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+(актив[ноаы]+|включен[оа]?|enabled|доступн[оа]?)\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'enabled', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+(пуст[оаы]?|пустой|empty)\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'empty', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+(?:содержит|contains)\s+["'«»""](.+?)["'«»""]\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'valueContains', target: extractTarget(m[1]), expected: m[2] };
+
+  m = body.match(/^(.+?)\s+(?:равно|равен|равна|=|==|equals?)\s+["'«»""](.+?)["'«»""]\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'valueEquals', target: extractTarget(m[1]), expected: m[2] };
+
+  m = body.match(/^(?:на\s+странице|в\s+тексте|текст)\s+(?:есть|содержит(?:ся)?|присутствует|contains|has)\s+["'«»""]?(.+?)["'«»""]?\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'textOnPage', expected: stripQuotes(m[1]) };
+
+  return { action, type: 'verify', verifyKind: 'textOnPage', expected: stripQuotes(body) };
+}
+
+// ---------- line parser ----------
+
+const WAIT_RE   = /^(?:подожди|подождать|ждать|пауза|сделай\s+паузу|wait|sleep|pause)\s+(\d+(?:[.,]\d+)?)\s*(?:секунд[аыу]?|сек|s|second[s]?)?\s*$/i;
+const PRESS_RE  = /^(?:нажми(?:\s+клавишу)?|нажать(?:\s+клавишу)?|жми|press|hit)\s+(.+)$/i;
+const SCROLL_RE = /^(?:прокрути|проскролль|скролл(?:ь)?|промотай|scroll)\s*(.*)$/i;
+const VERIFY_TRIGGER_RE = /^(?:проверь|проверить|убедись|убедиться|verify|check|assert|expect)(?:\s*,?\s*что)?\s+(.+)$/i;
+
+// Правый клик — идёт раньше обычного клика, чтобы «клик правой» не съедался «клик…».
+const RIGHT_CLICK_RE = /^(?:правый\s+клик|клик\s+правой(?:\s+кнопкой)?|клик\s+пкм|пкм|контекстное\s+меню|открой\s+контекстное\s+меню|right\s+click|context\s+menu|rclick)\s+(.+)$/i;
+
+const ACTIONS = [
+  { type: 'click',  re: /^(?:кликни|кликнуть|клик|тыкни|ткни|перейди|перейти|открой|открыть|click|tap|open|go to|visit)\s+(.+)/i },
+  { type: 'input',  re: /^(?:введи|ввести|напиши|написать|заполни|заполнить|вставь|вставить|input|type|fill|enter)\s+(.+)/i },
+  { type: 'select', re: /^(?:выбери|выбрать|отметь|отметить|select|choose|pick)\s+(.+)/i }
+];
+
+const EXPECT_RE = /^(?:результат|ожидаемый результат|result|expected result|then)\s*[:：-]\s*(.+)/i;
+
 function parseLine(line) {
   const clean = line.replace(/^\s*(?:\d+\.)+\s*/, '').trim();
   if (!clean) return null;
@@ -105,7 +226,28 @@ function parseLine(line) {
     return { action: clean, type: 'wait', target: null, value: sec, expected: null };
   }
 
-  for (const { type, re } of ACTIONS) {
+  const vm = clean.match(VERIFY_TRIGGER_RE);
+  if (vm) return parseVerify(vm[1], clean);
+
+  const pm = clean.match(PRESS_RE);
+  if (pm) {
+    const maybeKey = pm[1].trim();
+    if (looksLikeKey(maybeKey)) {
+      return { action: clean, type: 'press', key: maybeKey, target: null, value: null };
+    }
+  }
+
+  const sm = clean.match(SCROLL_RE);
+  if (sm) return parseScrollTail(sm[1], clean);
+
+  // Правый клик — проверяем до обычного клика
+  const rm = clean.match(RIGHT_CLICK_RE);
+  if (rm) {
+    return { action: clean, type: 'rightClick', target: extractTarget(rm[1]), value: null };
+  }
+
+  const CLICK_EXTRA = { type: 'click', re: /^(?:нажми|нажать)\s+(.+)/i };
+  for (const { type, re } of [CLICK_EXTRA, ...ACTIONS]) {
     const m = clean.match(re);
     if (!m) continue;
     const rest = m[1].trim();
@@ -115,6 +257,7 @@ function parseLine(line) {
     }
     return { action: clean, type, target: extractTarget(rest), value: null };
   }
+
   return { action: clean, type: 'click', target: clean, value: null };
 }
 
@@ -133,7 +276,7 @@ function parseScenario(text) {
         pending.expected = expected;
         flush();
       } else {
-        steps.push({ action: 'Проверка', type: 'verify', target: null, value: null, expected });
+        steps.push({ action: 'Проверка', type: 'verify', verifyKind: 'textOnPage', target: null, value: null, expected });
       }
       continue;
     }
@@ -144,6 +287,8 @@ function parseScenario(text) {
   flush();
   return steps;
 }
+
+// ---------- resolver ----------
 
 function normalize(s) {
   return String(s ?? '')
@@ -186,6 +331,8 @@ function resolveTarget(target, elements) {
     .sort((a, b) => b.score - a.score);
 }
 
+// ---------- transport ----------
+
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) throw new Error('Нет активной вкладки');
@@ -202,6 +349,8 @@ function tabCall(tabId, method, params) {
     });
   });
 }
+
+// ---------- UI ----------
 
 function addCard(step) {
   const card = document.createElement('div');
@@ -223,7 +372,7 @@ function addCard(step) {
 
 function setOk(card, detail, message) {
   card.className = 'card ok';
-  if (message) detail.textContent = message;
+  if (message !== undefined) detail.textContent = message;
 }
 
 function setErr(card, detail, message) {
@@ -235,6 +384,115 @@ function elLabel(el) {
   const t = el.tag || '?';
   const ty = el.type && el.type !== t ? `[type=${el.type}]` : '';
   return `<${t}${ty}>`;
+}
+
+// ---------- runner ----------
+
+async function performWait(seconds, card, detail) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const start = Date.now();
+  while (true) {
+    if (cancelled) throw new Error('Отменено пользователем');
+    const elapsed = (Date.now() - start) / 1000;
+    const remaining = Math.max(0, total - elapsed);
+    detail.textContent = `Осталось ${remaining.toFixed(1)} сек`;
+    if (remaining <= 0) break;
+    await delay(100);
+  }
+  detail.textContent = `Пауза ${total} сек завершена`;
+}
+
+async function runVerify(tabId, step) {
+  const kind = step.verifyKind || 'textOnPage';
+
+  if (kind === 'urlContains' || kind === 'urlEquals' || kind === 'titleContains' || kind === 'textOnPage') {
+    const snap = await tabCall(tabId, 'SNAPSHOT');
+    const want = String(step.expected ?? '');
+
+    if (kind === 'urlContains') {
+      if (!normalize(snap.url).includes(normalize(want))) {
+        throw new Error(`URL не содержит "${want}". Текущий: ${snap.url}`);
+      }
+      return;
+    }
+    if (kind === 'urlEquals') {
+      if (String(snap.url) !== want) {
+        throw new Error(`URL не равен "${want}". Текущий: ${snap.url}`);
+      }
+      return;
+    }
+    if (kind === 'titleContains') {
+      if (!normalize(snap.title).includes(normalize(want))) {
+        throw new Error(`Заголовок не содержит "${want}". Текущий: ${snap.title}`);
+      }
+      return;
+    }
+    const hay = normalize(snap.text);
+    const needle = normalize(want);
+    if (!needle) return;
+    if (hay.includes(needle)) return;
+    const tokens = needle.split(' ').filter(t => t.length > 2);
+    if (tokens.length) {
+      const hits = tokens.filter(t => hay.includes(t)).length;
+      if (hits / tokens.length >= 0.7) return;
+    }
+    throw new Error(`Текст не найден: "${want}"`);
+  }
+
+  if (!step.target) throw new Error('Не указана цель для проверки');
+
+  const desc = await tabCall(tabId, 'DESCRIBE');
+  const ranked = resolveTarget(step.target, desc.elements || []);
+  const top = ranked[0];
+  const found = top && top.score >= 0.55;
+
+  if (kind === 'notExists') {
+    if (found) throw new Error(`Элемент "${step.target}" существует: ${elLabel(top.el)} ${top.el.signature.slice(0, 80)}`);
+    return;
+  }
+  if (kind === 'hidden') {
+    if (found) throw new Error(`Элемент "${step.target}" виден, ожидалось скрытие: ${elLabel(top.el)} ${top.el.signature.slice(0, 80)}`);
+    return;
+  }
+  if (kind === 'visible' || kind === 'exists') {
+    if (!found) throw new Error(`Элемент "${step.target}" не найден или скрыт`);
+    return;
+  }
+
+  if (!found) {
+    throw new Error(`Элемент "${step.target}" не найден (score ${top ? top.score.toFixed(2) : '0'})`);
+  }
+
+  const check = await tabCall(tabId, 'CHECK_ELEMENT', {
+    id: top.el.id, kind, expected: step.expected
+  });
+  if (!check.ok) {
+    throw new Error(check.error || `Проверка «${kind}» не прошла`);
+  }
+}
+
+async function resolveAndHighlight(tabId, target) {
+  const desc = await tabCall(tabId, 'DESCRIBE');
+  const candidates = desc.elements || [];
+  if (!candidates.length) throw new Error('На странице не найдено интерактивных элементов');
+
+  const ranked = resolveTarget(target, candidates);
+  const top = ranked[0];
+  if (!top || top.score < 0.55) {
+    const near = ranked.slice(0, 3)
+      .map(r => `  • ${r.score.toFixed(2)} — ${elLabel(r.el)} ${r.el.signature.slice(0, 80)}`)
+      .join('\n');
+    throw new Error(`Цель не найдена (лучший score ${top ? top.score.toFixed(2) : '0'})\nКандидаты:\n${near}`);
+  }
+  if (ranked[1] && top.score - ranked[1].score < 0.05 && top.score < 0.9) {
+    const near = ranked.slice(0, 2)
+      .map(r => `  • ${r.score.toFixed(2)} — ${elLabel(r.el)} ${r.el.signature.slice(0, 80)}`)
+      .join('\n');
+    throw new Error(`Неоднозначная цель, уточните формулировку:\n${near}`);
+  }
+
+  try { await tabCall(tabId, 'HIGHLIGHT', { id: top.el.id, color: '#b388ff' }); } catch {}
+  return top;
 }
 
 async function run() {
@@ -269,53 +527,81 @@ async function run() {
     const { card, detail } = addCard(step);
 
     try {
+      // --- WAIT ---
       if (step.type === 'wait') {
-        const sec = Number.isFinite(step.value) ? step.value : 1;
-        await delay(sec * 1000);
-        setOk(card, detail, `Пауза ${sec} сек`);
+        await performWait(step.value, card, detail);
+        setOk(card, detail, detail.textContent);
         continue;
       }
 
-      if (step.type === 'verify' || !step.target) {
-        if (!step.expected) { setOk(card, detail, 'Пропущено'); continue; }
-        await verifyExpected(tab.id, step.expected);
-        setOk(card, detail, `✅ ${step.expected}`);
+      // --- PRESS ---
+      if (step.type === 'press') {
+        const res = await tabCall(tab.id, 'PERFORM', {
+          id: null, action: 'press', payload: step.key
+        });
+        const info = res.result || {};
+        detail.textContent = `Нажато ${info.actual || step.key}` +
+          (info.pressedOn ? ` в ${info.pressedOn}` : '') +
+          (info.defaultPrevented ? ' (обработано страницей)' : '');
+        await tabCall(tab.id, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 });
+        if (step.expected) {
+          await runVerify(tab.id, { type: 'verify', verifyKind: 'textOnPage', expected: step.expected });
+          detail.textContent += `\n✅ ${step.expected}`;
+        }
+        setOk(card, detail, detail.textContent);
         continue;
       }
 
-      const desc = await tabCall(tab.id, 'DESCRIBE');
-      const candidates = desc.elements || [];
-      if (!candidates.length) throw new Error('На странице не найдено интерактивных элементов');
-
-      const ranked = resolveTarget(step.target, candidates);
-      const top = ranked[0];
-      if (!top || top.score < 0.55) {
-        const near = ranked.slice(0, 3)
-          .map(r => `  • ${r.score.toFixed(2)} — ${elLabel(r.el)} ${r.el.signature.slice(0, 80)}`)
-          .join('\n');
-        throw new Error(`Цель не найдена (лучший score ${top ? top.score.toFixed(2) : '0'})\nКандидаты:\n${near}`);
+      // --- SCROLL ---
+      if (step.type === 'scroll') {
+        let params;
+        let human;
+        if (step.scrollTo) {
+          const desc = await tabCall(tab.id, 'DESCRIBE');
+          const ranked = resolveTarget(step.scrollTo, desc.elements || []);
+          const top = ranked[0];
+          if (!top || top.score < 0.55) {
+            throw new Error(`Элемент для прокрутки не найден: "${step.scrollTo}" (score ${top ? top.score.toFixed(2) : '0'})`);
+          }
+          params = { targetId: top.el.id };
+          human = `до ${elLabel(top.el)} ${top.el.signature.slice(0, 80)} (${top.score.toFixed(2)})`;
+        } else {
+          params = { direction: step.direction, amount: step.amount };
+          const dir = { up: 'вверх', down: 'вниз', top: 'в начало', bottom: 'в конец' }[step.direction] || step.direction;
+          human = `${dir}${step.amount ? ` на ${step.amount}px` : ''}`;
+        }
+        await tabCall(tab.id, 'SCROLL', params);
+        await delay(500);
+        setOk(card, detail, `Прокручено ${human}`);
+        continue;
       }
-      if (ranked[1] && top.score - ranked[1].score < 0.05 && top.score < 0.9) {
-        const near = ranked.slice(0, 2)
-          .map(r => `  • ${r.score.toFixed(2)} — ${elLabel(r.el)} ${r.el.signature.slice(0, 80)}`)
-          .join('\n');
-        throw new Error(`Неоднозначная цель, уточните формулировку:\n${near}`);
+
+      // --- VERIFY ---
+      if (step.type === 'verify') {
+        await runVerify(tab.id, step);
+        const label = step.expected ? `✅ ${step.expected}` : '✅ Проверка пройдена';
+        setOk(card, detail, label);
+        continue;
       }
 
-      try { await tabCall(tab.id, 'HIGHLIGHT', { id: top.el.id, color: '#b388ff' }); } catch {}
-
+      // --- CLICK / RIGHTCLICK / INPUT / SELECT ---
+      const top = await resolveAndHighlight(tab.id, step.target);
       detail.textContent = `Цель: ${elLabel(top.el)} ${top.el.signature.slice(0, 100)} (${top.score.toFixed(2)})`;
 
+      const actionMap = { rightClick: 'rightClick' };
+      const action = actionMap[step.type] || step.type;
+
       const res = await tabCall(tab.id, 'PERFORM', {
-        id: top.el.id,
-        action: step.type,
-        payload: step.value
+        id: top.el.id, action, payload: step.value
       });
 
       if (step.type === 'input') {
         detail.textContent = `Записано в ${elLabel(top.el)}: "${String(res.result?.actual ?? '').slice(0, 100)}"`;
       } else if (step.type === 'select' && res.result?.actual != null) {
         detail.textContent = `Выбрано в ${elLabel(top.el)}: "${res.result.actual}"`;
+      } else if (step.type === 'rightClick') {
+        const handled = res.result?.defaultPrevented ? 'контекстное меню перехвачено страницей' : 'отправлено';
+        detail.textContent = `Правый клик в ${elLabel(top.el)} (${handled})`;
       } else {
         detail.textContent = `Клик в ${elLabel(top.el)}`;
       }
@@ -323,7 +609,7 @@ async function run() {
       await tabCall(tab.id, 'WAIT_STABLE', { quietMs: 250, timeoutMs: 4000 });
 
       if (step.expected) {
-        await verifyExpected(tab.id, step.expected);
+        await runVerify(tab.id, { type: 'verify', verifyKind: 'textOnPage', expected: step.expected });
         setOk(card, detail, detail.textContent + `\n✅ ${step.expected}`);
       } else {
         setOk(card, detail, detail.textContent);
@@ -337,25 +623,12 @@ async function run() {
   resetButtons();
 }
 
-async function verifyExpected(tabId, expected) {
-  const snap = await tabCall(tabId, 'SNAPSHOT');
-  const hay = normalize(snap.text);
-  const needle = normalize(expected);
-  if (!needle) return;
-  if (hay.includes(needle)) return;
-
-  const tokens = needle.split(' ').filter(t => t.length > 2);
-  if (tokens.length) {
-    const hits = tokens.filter(t => hay.includes(t)).length;
-    if (hits / tokens.length >= 0.7) return;
-  }
-  throw new Error(`Ожидаемый текст не найден: "${expected}"`);
-}
-
 function resetButtons() {
   $run.disabled = false;
   $cancel.disabled = true;
 }
+
+// ---------- wire up ----------
 
 $run.addEventListener('click', run);
 $cancel.addEventListener('click', () => { cancelled = true; });
