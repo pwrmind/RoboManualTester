@@ -21,6 +21,9 @@
     '[role="menuitemradio"]',
     '[role="option"]',
     '[role="tab"]',
+    '[role="checkbox"]',
+    '[role="radio"]',
+    '[role="switch"]',
     '[contenteditable=""]',
     '[contenteditable="true"]'
   ].join(',');
@@ -38,9 +41,6 @@
       .trim();
   }
 
-  // Убирает эмодзи, вариационные селекторы, ZWJ и skin-tone модификаторы.
-  // Lexical и другие rich-редакторы хранят эмодзи в модели, но рендерят их
-  // пустым декоратором — в textContent символа нет.
   function stripEmoji(s) {
     return String(s ?? '')
       .replace(/\p{Extended_Pictographic}/gu, '')
@@ -54,6 +54,29 @@
       return ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(t);
     }
     return el.isContentEditable === true;
+  }
+
+  function isCheckable(el) {
+    if (el.tagName === 'INPUT') {
+      const t = (el.type || '').toLowerCase();
+      return t === 'checkbox' || t === 'radio';
+    }
+    const role = el.getAttribute('role');
+    return role === 'checkbox' || role === 'radio' || role === 'switch';
+  }
+
+  function isChecked(el) {
+    if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
+      return !!el.checked;
+    }
+    const aria = el.getAttribute('aria-checked');
+    if (aria === 'true') return true;
+    if (aria === 'false') return false;
+    const role = el.getAttribute('role');
+    if (role === 'checkbox' || role === 'radio' || role === 'switch') {
+      return el.getAttribute('data-state') === 'checked';
+    }
+    return false;
   }
 
   function isVisible(el) {
@@ -96,6 +119,20 @@
     return '';
   }
 
+  // Текст ближайшего контейнера — используется для чекбоксов/радио,
+  // у которых нет собственного текста, а смысл в соседнем <span>/<a>/<label>.
+  function getContainerText(el) {
+    let node = el.parentElement;
+    let hops = 0;
+    while (node && hops < 4) {
+      const txt = (node.innerText || node.textContent || '').trim();
+      if (txt.length > 0 && txt.length < 500) return txt;
+      node = node.parentElement;
+      hops++;
+    }
+    return '';
+  }
+
   function buildDescriptor(el) {
     const rawText = (el.innerText || el.textContent || '').trim();
     const aria = el.getAttribute('aria-label') || '';
@@ -108,7 +145,10 @@
     const alt = el.getAttribute('alt') || '';
     const label = getLabelText(el);
 
-    const pieces = [aria, label, placeholder, title, alt, rawText]
+    const checkable = isCheckable(el);
+    const containerText = checkable && !label ? getContainerText(el) : '';
+
+    const pieces = [aria, label, placeholder, title, alt, rawText, containerText]
       .map(normalize)
       .filter(Boolean);
 
@@ -121,11 +161,14 @@
       name: el.getAttribute('name') || '',
       placeholder: normalize(placeholder),
       text: normalize(rawText),
+      containerText: normalize(containerText),
       signature,
       disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
       visible: isVisible(el),
       covered: isCovered(el),
-      editable: isEditable(el)
+      editable: isEditable(el),
+      checkable,
+      checked: checkable ? isChecked(el) : null
     };
   }
 
@@ -322,17 +365,11 @@
 
   // ---------- contenteditable insertion ----------
 
-  // Считаем вхождения probe в тексте, предварительно вычистив эмодзи с обеих сторон.
-  // Это единственный способ ужиться с редакторами, которые рендерят эмодзи как декораторы.
   function countProbe(text, value) {
     const hay = stripEmoji(text).replace(/\s+/g, ' ').trim().toLowerCase();
     const valueClean = stripEmoji(value).replace(/\s+/g, ' ').trim();
     const probe = Array.from(valueClean).slice(0, 15).join('').toLowerCase();
-    if (!probe) {
-      // значение состоит только из эмодзи/символов — не можем отличить успех от провала
-      // по тексту, считаем, что редактор справился (emоji-декораторы мы не видим)
-      return { count: hay.length > 0 ? 1 : 1, probe: '' };
-    }
+    if (!probe) return { count: hay.length > 0 ? 1 : 1, probe: '' };
     let count = 0;
     let idx = 0;
     while ((idx = hay.indexOf(probe, idx)) !== -1) {
@@ -402,6 +439,50 @@
     return { ok: true, actual: text.trim() };
   }
 
+  // ---------- check / uncheck ----------
+
+  async function performCheck(el, wantChecked) {
+    if (!isCheckable(el)) {
+      // Кастомный «чекбокс» без role — просто кликаем.
+      if (wantChecked !== null) {
+        el.click();
+        await sleep(80);
+        return { ok: true, actual: 'clicked' };
+      }
+    }
+
+    const before = isChecked(el);
+    if (before === wantChecked) {
+      return { ok: true, actual: wantChecked, alreadyInState: true };
+    }
+
+    el.focus();
+    try { el.click(); } catch {}
+    await sleep(80);
+
+    let after = isChecked(el);
+
+    // Если клик не изменил состояние — попробуем нативно установить value.
+    if (after !== wantChecked && el.tagName === 'INPUT') {
+      if (el._valueTracker) { try { el._valueTracker.setValue(!wantChecked); } catch {} }
+      el.checked = wantChecked;
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(60);
+      after = isChecked(el);
+    }
+
+    if (after !== wantChecked) {
+      throw new Error(
+        `Не удалось ${wantChecked ? 'установить' : 'снять'} чекбокс. ` +
+        `Состояние осталось ${after ? 'включённым' : 'выключенным'}. ` +
+        `Тег <${el.tagName.toLowerCase()}${el.type ? `[type=${el.type}]` : ''}>.`
+      );
+    }
+
+    return { ok: true, actual: after };
+  }
+
   // ---------- operations ----------
 
   function describe() {
@@ -455,6 +536,25 @@
     if (action === 'click') {
       el.click();
       return { ok: true, actual: null };
+    }
+
+    if (action === 'check') {
+      if (isCovered(el)) {
+        // Для чекбоксов перекрытие — часто норма: сам input скрыт, показан красивый кружок.
+        // В этом случае кликаем по связанному label, если он есть.
+        const label = el.closest('label') || (el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`));
+        if (label) {
+          label.click();
+          await sleep(100);
+          const after = isChecked(el);
+          if (after === true) return { ok: true, actual: true, viaLabel: true };
+        }
+      }
+      return await performCheck(el, true);
+    }
+
+    if (action === 'uncheck') {
+      return await performCheck(el, false);
     }
 
     if (action === 'rightClick') {
@@ -593,6 +693,16 @@
       }
       if (actual === want) return { ok: true, details: { actual } };
       return { ok: false, error: `"${actual.slice(0, 60)}" ≠ "${want}"`, details: { actual } };
+    }
+
+    if (kind === 'checked' || kind === 'unchecked') {
+      if (!isCheckable(el)) {
+        return { ok: false, error: 'Элемент не является чекбоксом' };
+      }
+      const actual = isChecked(el);
+      if (kind === 'checked' && !actual) return { ok: false, error: 'Чекбокс не отмечен' };
+      if (kind === 'unchecked' && actual) return { ok: false, error: 'Чекбокс отмечен' };
+      return { ok: true, details: { actual } };
     }
 
     return { ok: false, error: `Неизвестный вид проверки: ${kind}` };

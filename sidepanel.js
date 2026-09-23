@@ -193,6 +193,12 @@ function parseVerify(rest, action) {
   m = body.match(/^(.+?)\s+(?:равно|равен|равна|=|==|equals?)\s+["'«»""](.+?)["'«»""]\s*$/i);
   if (m) return { action, type: 'verify', verifyKind: 'valueEquals', target: extractTarget(m[1]), expected: m[2] };
 
+  m = body.match(/^(.+?)\s+(?:отмечен[оаы]?|включён[оаы]?|checked)\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'checked', target: extractTarget(m[1]) };
+
+  m = body.match(/^(.+?)\s+(?:не\s+отмечен[оаы]?|снят[оаы]?|unchecked)\s*$/i);
+  if (m) return { action, type: 'verify', verifyKind: 'unchecked', target: extractTarget(m[1]) };
+
   m = body.match(/^(?:на\s+странице|в\s+тексте|текст)\s+(?:есть|содержит(?:ся)?|присутствует|contains|has)\s+["'«»""]?(.+?)["'«»""]?\s*$/i);
   if (m) return { action, type: 'verify', verifyKind: 'textOnPage', expected: stripQuotes(m[1]) };
 
@@ -205,6 +211,10 @@ const WAIT_RE   = /^(?:подожди|подождать|жди|обожди|о�
 const PRESS_RE  = /^(?:нажми(?:\s+клавишу)?|нажать(?:\s+клавишу)?|жми|press|hit)\s+(.+)$/i;
 const SCROLL_RE = /^(?:прокрути|проскролль|скролл(?:ь)?|промотай|scroll)\s*(.*)$/i;
 const VERIFY_TRIGGER_RE = /^(?:проверь|проверить|убедись|убедиться|verify|check|assert|expect)(?:\s*,?\s*что)?\s+(.+)$/i;
+
+// Check / uncheck — раньше verify, чтобы «поставь чекбокс» не улетел в verify.
+const CHECK_RE   = /^(?:поставь|отметь|установи|выбери|check|tick|select)\s+(?:чекбокс|галочку|checkbox|check\s*box)\s+(.+)$/i;
+const UNCHECK_RE = /^(?:сними|убери|uncheck|untick|deselect)\s+(?:чекбокс|галочку|checkbox|check\s*box)\s+(.+)$/i;
 
 const TAB_LIST_RE    = /^(?:список\s+вкладок|покажи\s+вкладки|list\s+tabs|show\s+tabs)$/i;
 const TAB_SWITCH_RE  = /^(?:переключись(?:\s+на)?|активируй|switch\s+to|activate|go\s+to)\s+(?:вкладку|таб|tab)\s+(.+)$/i;
@@ -234,6 +244,16 @@ function parseLine(line) {
   if (wm) {
     const sec = parseFloat(wm[1].replace(',', '.'));
     return { action: clean, type: 'wait', target: null, value: sec, expected: null };
+  }
+
+  // check / uncheck — раньше verify
+  {
+    const m = clean.match(CHECK_RE);
+    if (m) return { action: clean, type: 'check', target: extractTarget(m[1]), value: null };
+  }
+  {
+    const m = clean.match(UNCHECK_RE);
+    if (m) return { action: clean, type: 'uncheck', target: extractTarget(m[1]), value: null };
   }
 
   const vm = clean.match(VERIFY_TRIGGER_RE);
@@ -353,6 +373,25 @@ function normalize(s) {
     .trim();
 }
 
+// Разбирает target на режим и «тело».
+// - "Telegram..." или "Telegram…"  → mode='prefix', body='Telegram'
+// - "...на обработку данных"       → mode='suffix', body='на обработку данных'
+// - "Обычный текст"                → mode='contains', body='Обычный текст'
+function analyzeTarget(target) {
+  const t = String(target ?? '').trim();
+  if (!t) return { mode: 'contains', body: '' };
+
+  if (/\.{2,}\s*$/.test(t) || /…\s*$/.test(t)) {
+    const body = t.replace(/\.{2,}\s*$/, '').replace(/…\s*$/, '').trim();
+    return { mode: 'prefix', body };
+  }
+  if (/^\.{2,}/.test(t) || /^…/.test(t)) {
+    const body = t.replace(/^\.{2,}/, '').replace(/^…/, '').trim();
+    return { mode: 'suffix', body };
+  }
+  return { mode: 'contains', body: t };
+}
+
 function tokenScore(a, b) {
   const A = new Set(a.split(' ').filter(Boolean));
   const B = new Set(b.split(' ').filter(Boolean));
@@ -363,25 +402,50 @@ function tokenScore(a, b) {
   return inter / union;
 }
 
-function scoreCandidate(target, el) {
-  const t = normalize(target);
+function scoreCandidate(target, el, hint = {}) {
+  const { mode, body } = analyzeTarget(target);
+  const t = normalize(body);
   if (!t) return 0;
-  const variants = [el.text, el.signature].filter(Boolean);
+
+  const variants = [el.text, el.signature, el.containerText].filter(Boolean);
   let best = 0;
+
   for (const v of variants) {
+    if (mode === 'prefix') {
+      if (v === t) { best = Math.max(best, 1); continue; }
+      if (v.startsWith(t)) { best = Math.max(best, 0.95); continue; }
+      // «Telegram» + дальше какой-то хвост — нормально, но слабее.
+      const first = v.split(/[\s,|·]+/)[0];
+      if (first === t) { best = Math.max(best, 0.9); continue; }
+      continue;
+    }
+    if (mode === 'suffix') {
+      if (v === t) { best = Math.max(best, 1); continue; }
+      if (v.endsWith(t)) { best = Math.max(best, 0.95); continue; }
+      if (v.includes(t)) { best = Math.max(best, 0.7); continue; }
+      continue;
+    }
+    // обычный режим
     if (v === t) { best = Math.max(best, 1); continue; }
     if (v.startsWith(t)) { best = Math.max(best, 0.95); continue; }
     if (v.includes(t)) { best = Math.max(best, 0.9); continue; }
     if (t.includes(v) && v.length >= 3) { best = Math.max(best, 0.75); continue; }
     best = Math.max(best, tokenScore(t, v) * 0.85);
   }
+
   if (el.covered) best *= 0.7;
+
+  // Приоритет чекбоксам/радио, когда этого просит действие.
+  if (hint.preferCheckable) {
+    if (!el.checkable) best *= 0.35;
+  }
+
   return best;
 }
 
-function resolveTarget(target, elements) {
+function resolveTarget(target, elements, hint = {}) {
   return elements
-    .map(el => ({ el, score: scoreCandidate(target, el) }))
+    .map(el => ({ el, score: scoreCandidate(target, el, hint) }))
     .sort((a, b) => b.score - a.score);
 }
 
@@ -477,7 +541,6 @@ async function waitForStableAfterNavigation(tabId, { attempts = 6, delayMs = 400
 
 // ---------- new-tab detection ----------
 
-// Снимок идентификаторов вкладок в текущем окне.
 async function snapshotTabIds() {
   try {
     const res = await tabsCall('LIST', { currentTabId });
@@ -488,8 +551,6 @@ async function snapshotTabIds() {
   }
 }
 
-// Пытается несколько раз найти вкладку, которой не было в prevIds.
-// Окно ожидания ~1.5 сек (200 + 300 + 400 + 600).
 async function detectNewTab(prevIds) {
   const schedule = [200, 300, 400, 600];
   for (const wait of schedule) {
@@ -559,8 +620,9 @@ async function runVerify(tabId, step) {
 
   if (!step.target) throw new Error('Не указана цель для проверки');
 
+  const hint = (kind === 'checked' || kind === 'unchecked') ? { preferCheckable: true } : {};
   const desc = await tabCall(tabId, 'DESCRIBE');
-  const ranked = resolveTarget(step.target, desc.elements || []);
+  const ranked = resolveTarget(step.target, desc.elements || [], hint);
   const top = ranked[0];
   const found = top && top.score >= 0.55;
 
@@ -589,12 +651,12 @@ async function runVerify(tabId, step) {
   }
 }
 
-async function resolveAndHighlight(tabId, target) {
+async function resolveAndHighlight(tabId, target, hint = {}) {
   const desc = await tabCall(tabId, 'DESCRIBE');
   const candidates = desc.elements || [];
   if (!candidates.length) throw new Error('На странице не найдено интерактивных элементов');
 
-  const ranked = resolveTarget(target, candidates);
+  const ranked = resolveTarget(target, candidates, hint);
   const top = ranked[0];
   if (!top || top.score < 0.55) {
     const near = ranked.slice(0, 3)
@@ -790,17 +852,25 @@ async function run() {
         continue;
       }
 
-      const top = await resolveAndHighlight(currentTabId, step.target);
+      // hint для резолвера
+      const hint = (step.type === 'check' || step.type === 'uncheck')
+        ? { preferCheckable: true }
+        : {};
+
+      const top = await resolveAndHighlight(currentTabId, step.target, hint);
       detail.textContent = `Цель: ${elLabel(top.el)} ${top.el.signature.slice(0, 100)} (${top.score.toFixed(2)})`;
 
-      // Перед клик'ом — снимаем снимок вкладок, чтобы после понять, не открылась ли новая.
       const isClickLike = step.type === 'click' || step.type === 'rightClick';
       let tabSnapshot = null;
       if (isClickLike) {
         tabSnapshot = await snapshotTabIds();
       }
 
-      const actionMap = { rightClick: 'rightClick' };
+      const actionMap = {
+        rightClick: 'rightClick',
+        check: 'check',
+        uncheck: 'uncheck'
+      };
       const action = actionMap[step.type] || step.type;
 
       const res = await tabCall(currentTabId, 'PERFORM', {
@@ -821,13 +891,16 @@ async function run() {
         } else if (step.type === 'rightClick') {
           const handled = res.result?.defaultPrevented ? 'контекстное меню перехвачено страницей' : 'отправлено';
           detail.textContent = `Правый клик в ${elLabel(top.el)} (${handled})`;
+        } else if (step.type === 'check') {
+          detail.textContent = `Чекбокс установлен в ${elLabel(top.el)}` +
+            (res.result?.viaLabel ? ' (через label)' : '');
+        } else if (step.type === 'uncheck') {
+          detail.textContent = `Чекбокс снят в ${elLabel(top.el)}`;
         } else {
           detail.textContent = `Клик в ${elLabel(top.el)}`;
         }
       }
 
-      // Если был клик — проверяем, не открылась ли новая вкладка.
-      // Тогда переключаемся туда и продолжаем прогон в ней.
       let switchedToNewTab = false;
       if (isClickLike && tabSnapshot) {
         const newTab = await detectNewTab(tabSnapshot.ids);
